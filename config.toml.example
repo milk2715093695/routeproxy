@@ -1,0 +1,17 @@
+# 通用 HTTP 代理示例。复制为 config.toml 并调整路径。
+# 透明模式仅用于 Android Magisk；参见 packaging/android/config.toml.example。
+
+[proxy]
+mode = "http"
+listen = ["127.0.0.1:6045", "[::1]:6045"]
+upstream = "127.0.0.1:9910"
+
+[rules]
+file = "/path/to/routeproxy/rules.toml"
+reload = true
+
+[logging]
+file = "/path/to/routeproxy/routeproxy.log"
+level = "info"
+max_size_mb = 5
+keep = 3

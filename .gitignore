@@ -1,0 +1,41 @@
+/target/
+/dist/
+/packaging/android/dist/
+/taskbooks/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.TemporaryItems/
+.DocumentRevisions-V100/
+.com.apple.timemachine.donotpresent
+.apdisk
+.VolumeIcon.icns
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+~$*
+
+# Linux / Unix
+*~
+.directory
+.Trash-*/
+*.swp
+*.swo
+.nfs*
+lost+found/
+
+# 编辑器/临时文件
+*.bak
+*.orig
+*.rej
+*.tmp

@@ -1,0 +1,173 @@
+name: Routeproxy 发布
+
+on:
+  push:
+    tags:
+      - "routeproxy-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: routeproxy-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - name: 确认工作区干净
+        run: test -z "$(git status --porcelain)"
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag="${GITHUB_REF_NAME#routeproxy-v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "$version" != "$tag" ]; then
+            echo "VERSION ($version) 与 tag ($tag) 不一致" >&2
+            exit 1
+          fi
+          if [ "$version" != "$cargo_version" ]; then
+            echo "VERSION ($version) 与 Cargo.toml 版本 ($cargo_version) 不一致" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: 校验规则 seed
+        run: cargo run --quiet -- rules check --file rules.toml
+      - name: 格式
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: 测试
+        run: cargo test
+      - name: Shell 语法
+        run: find packaging -name '*.sh' -print0 | xargs -0 -n1 sh -n
+
+  macos:
+    needs: verify
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: 构建 universal 包
+        run: sh packaging/macos/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/routeproxy-*-macos-universal.tar.gz
+          if-no-files-found: error
+
+  android:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: android-actions/setup-android@v3
+      - name: 安装 NDK 与工具
+        run: |
+          set -euo pipefail
+          sdkmanager "ndk;27.2.12479018" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zip
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: aarch64-linux-android
+      - name: 安装 cargo-ndk
+        run: cargo install cargo-ndk --locked --version 3.5.4
+      - name: 构建 Android 二进制
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$PWD=/routeproxy" \
+            cargo ndk -t arm64-v8a build --release
+      - name: 构建 Magisk zip
+        run: sh packaging/android/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: packaging/android/dist/routeproxy-tp-*.zip
+          if-no-files-found: error
+
+  termux:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: android-actions/setup-android@v3
+      - name: 安装 NDK
+        run: |
+          set -euo pipefail
+          sdkmanager "ndk;27.2.12479018" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: aarch64-linux-android
+      - name: 安装 cargo-ndk
+        run: cargo install cargo-ndk --locked --version 3.5.4
+      - name: 构建 Termux 二进制
+        run: |
+          RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$PWD=/routeproxy" \
+            cargo ndk -t arm64-v8a build --release
+      - name: 打包 Termux 资产
+        run: sh packaging/termux/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termux
+          path: dist/routeproxy-*-termux-aarch64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: 构建 Windows 二进制
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE\.cargo=/cargo --remap-path-prefix=$env:GITHUB_WORKSPACE=/routeproxy"
+          cargo build --release --target x86_64-pc-windows-msvc
+      - name: 打包 Windows 资产
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Binary target/x86_64-pc-windows-msvc/release/routeproxy.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/routeproxy-*-windows-x86_64.zip
+          if-no-files-found: error
+
+  release:
+    needs: [verify, macos, android, termux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 生成校验和
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: routeproxy ${{ needs.verify.outputs.version }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true

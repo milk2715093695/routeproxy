@@ -1,0 +1,14 @@
+[proxy]
+mode = "transparent"
+listen = ["127.0.0.1:6045"]
+upstream = "127.0.0.1:9910"
+
+[rules]
+file = "/data/adb/routeproxy/rules.toml"
+reload = true
+
+[logging]
+file = "/data/adb/routeproxy/logs/routeproxy.log"
+level = "info"
+max_size_mb = 5
+keep = 3
