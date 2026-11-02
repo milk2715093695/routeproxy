@@ -77,6 +77,34 @@ fn execute() -> Result<()> {
 
 fn handle_rules(cmd: RulesCommand) -> Result<()> {
     match cmd {
+        RulesCommand::Build {
+            direct,
+            proxy,
+            local_tlds,
+            cidrs,
+            upstream_sha,
+            updated_at,
+            output,
+        } => {
+            let counts = rules::build::build(rules::build::BuildInput {
+                direct,
+                proxy,
+                local_tlds,
+                cidrs,
+                upstream_sha,
+                updated_at,
+                output: output.clone(),
+            })?;
+            println!(
+                "规则构建完成: {} (direct={}, proxy={}, local_tlds={}, cidrs={})",
+                output.display(),
+                counts.direct,
+                counts.proxy,
+                counts.local_tlds,
+                counts.cidrs
+            );
+            Ok(())
+        }
         RulesCommand::Check { file } => {
             let rules = rules::model::Rules::load(&file)?;
             let counts = rules.counts();

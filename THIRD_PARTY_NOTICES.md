@@ -54,6 +54,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
 - 本项目修改：从 `cidrs-cn.txt` 提取 CIDR 列表，转换为 TOML 数组，去重后
   与其他规则合并为 `rules.toml`；未修改单个 CIDR 的地址范围。
 - 免责声明：CIDR 数据按“原样”提供，不保证完整、准确或适用于特定用途；

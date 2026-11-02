@@ -80,6 +80,27 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum RulesCommand {
     #[command(
+        about = "构建规则快照",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "选项"
+    )]
+    Build {
+        #[arg(long, value_name = "FILE", help = "直连域名文件，可重复")]
+        direct: Vec<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "代理域名文件，可重复")]
+        proxy: Vec<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "本地 TLD 文件，可重复")]
+        local_tlds: Vec<PathBuf>,
+        #[arg(long, value_name = "FILE", help = "CIDR 文件，可重复")]
+        cidrs: Vec<PathBuf>,
+        #[arg(long, value_name = "SHA", help = "上游 40 位十六进制提交")]
+        upstream_sha: String,
+        #[arg(long, value_name = "RFC3339", help = "快照时间")]
+        updated_at: String,
+        #[arg(long, value_name = "PATH", help = "输出规则文件")]
+        output: PathBuf,
+    },
+    #[command(
         about = "校验规则文件",
         help_template = HELP_TEMPLATE,
         next_help_heading = "选项"
