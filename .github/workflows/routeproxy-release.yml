@@ -73,6 +73,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: 安装 NDK 与工具
         run: |
           set -euo pipefail
@@ -104,6 +106,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: 安装 NDK
         run: |
           set -euo pipefail
