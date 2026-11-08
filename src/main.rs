@@ -6,6 +6,7 @@ mod http;
 mod logging;
 mod net;
 mod platform;
+mod relay;
 mod rules;
 mod transparent;
 

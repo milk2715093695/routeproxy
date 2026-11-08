@@ -14,7 +14,6 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, Incoming};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::time::timeout;
@@ -22,6 +21,7 @@ use tokio::time::timeout;
 use crate::config::Config;
 use crate::engine::{Decision, Engine, HostResolution};
 use crate::net::canonicalize_addr;
+use crate::relay::copy_bidirectional_idle;
 
 use super::{
     error_response, full_body, host_header, normalize_authority_host, strip_hop_by_hop, BoxBody,
@@ -274,7 +274,12 @@ async fn forward(
             ));
         };
         let upstream_upgrade = hyper::upgrade::on(&mut response);
-        spawn_upgrade_tunnel(client_upgrade, upstream_upgrade, permit);
+        spawn_upgrade_tunnel(
+            client_upgrade,
+            upstream_upgrade,
+            permit,
+            config.idle_timeout(),
+        );
         return Ok(response.map(|_| full_body("")));
     }
 
@@ -312,6 +317,7 @@ fn spawn_upgrade_tunnel(
     client_upgrade: hyper::upgrade::OnUpgrade,
     upstream_upgrade: hyper::upgrade::OnUpgrade,
     permit: Arc<OwnedSemaphorePermit>,
+    idle_timeout: Duration,
 ) {
     tokio::spawn(async move {
         let _permit = permit;
@@ -331,7 +337,8 @@ fn spawn_upgrade_tunnel(
         };
         let mut client = TokioIo::new(client);
         let mut upstream = TokioIo::new(upstream);
-        if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
+        if let Err(error) = copy_bidirectional_idle(&mut client, &mut upstream, idle_timeout).await
+        {
             tracing::debug!("升级流关闭: {error}");
         }
     });

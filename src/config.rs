@@ -1,6 +1,7 @@
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -34,6 +35,12 @@ pub struct ProxyConfig {
     pub mode: Mode,
     pub listen: Vec<String>,
     pub upstream: String,
+    /// 同时活跃的 TCP 连接/请求上限。
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// 双向连接无数据多久后回收；避免半关闭连接长期占用槽位。
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +82,12 @@ impl Config {
         }
         if self.proxy.listen.is_empty() {
             bail!("proxy.listen 至少需要一个地址");
+        }
+        if self.proxy.max_connections == 0 {
+            bail!("proxy.max_connections 必须大于 0");
+        }
+        if self.proxy.idle_timeout_secs == 0 {
+            bail!("proxy.idle_timeout_secs 必须大于 0");
         }
 
         let mut listens = Vec::with_capacity(self.proxy.listen.len());
@@ -153,10 +166,26 @@ impl Config {
         self.upstream
             .expect("Config::validate 必须填充 upstream 地址")
     }
+
+    pub fn max_connections(&self) -> usize {
+        self.proxy.max_connections
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.proxy.idle_timeout_secs)
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_max_connections() -> usize {
+    4096
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    300
 }
 
 fn default_max_size() -> u64 {
@@ -165,4 +194,44 @@ fn default_max_size() -> u64 {
 
 fn default_keep() -> usize {
     3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &str) -> Config {
+        let text = format!(
+            r#"
+[proxy]
+mode = "http"
+listen = ["127.0.0.1:16045"]
+upstream = "127.0.0.1:9910"
+{extra}
+[rules]
+file = "rules.toml"
+[logging]
+file = "routeproxy.log"
+level = "info"
+"#
+        );
+        toml::from_str(&text).expect("配置应可解析")
+    }
+
+    #[test]
+    fn connection_limits_use_defaults() {
+        let mut config = parse("");
+        config.validate().unwrap();
+        assert_eq!(config.max_connections(), 4096);
+        assert_eq!(config.idle_timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn rejects_zero_connection_limits() {
+        let mut max = parse("max_connections = 0");
+        assert!(max.validate().is_err());
+
+        let mut idle = parse("idle_timeout_secs = 0");
+        assert!(idle.validate().is_err());
+    }
 }

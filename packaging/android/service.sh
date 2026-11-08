@@ -76,6 +76,10 @@ start_service() {
         log "配置文件缺失: $CONF"
         return 1
     fi
+
+    # 连接上限接近默认值时，fd 预算必须留出余量。
+    ulimit -n 65536 2>/dev/null || ulimit -n 16384 2>/dev/null || log "无法提高 fd 上限"
+
     PORT="$(read_port "$CONF")" || {
         log "监听地址无效: $CONF"
         return 1

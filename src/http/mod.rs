@@ -25,10 +25,6 @@ use crate::engine::Engine;
 pub mod connect;
 pub mod proxy;
 
-/// 活跃上游请求/隧道的并发上限；空闲 keep-alive 不占用请求许可。
-pub(crate) const MAX_ACTIVE_CONNECTIONS: usize = 512;
-/// 单进程连接槽上限；限制空闲 keep-alive 和慢客户端占用的 fd。
-const MAX_CONNECTION_SLOTS: usize = 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type BoxBody = UnsyncBoxBody<Bytes, Box<dyn Error + Send + Sync>>;
@@ -75,8 +71,10 @@ pub(crate) async fn wait_for_listeners(
 }
 
 pub async fn serve(config: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
-    let permits = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
-    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTION_SLOTS));
+    let max_connections = config.max_connections();
+    let permits = Arc::new(Semaphore::new(max_connections));
+    // keep-alive 槽位高于活跃请求许可，避免空闲连接把新请求全部挡在门外。
+    let connection_slots = Arc::new(Semaphore::new(max_connections.saturating_add(1024)));
     let listeners = bind_listeners(&config, "proxy").await?;
     let mut tasks = JoinSet::new();
 

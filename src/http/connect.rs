@@ -5,13 +5,14 @@ use anyhow::{bail, Context, Result};
 use hyper::body::Incoming;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::timeout;
 
 use crate::config::Config;
 use crate::engine::{Decision, Engine};
+use crate::relay::copy_bidirectional_idle;
 
 use super::proxy::connect_direct;
 use super::{error_response, full_body, host_header, normalize_authority_host, BoxBody};
@@ -71,7 +72,9 @@ pub async fn handle(
             }
         };
         let mut client = TokioIo::new(upgraded);
-        if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
+        if let Err(error) =
+            copy_bidirectional_idle(&mut client, &mut upstream, config.idle_timeout()).await
+        {
             tracing::debug!("CONNECT 隧道关闭: {error}");
         }
     });

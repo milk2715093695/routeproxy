@@ -34,6 +34,8 @@ Android 交叉编译、macOS/Termux/Windows 打包脚本在 `packaging/` 下。
 mode = "http"
 listen = ["127.0.0.1:6045", "[::1]:6045"]
 upstream = "127.0.0.1:9910"
+max_connections = 4096
+idle_timeout_secs = 300
 
 [rules]
 file = "/path/to/routeproxy/rules.toml"
@@ -53,6 +55,8 @@ keep = 3
 | `proxy` | `mode` | 是 | — | `http` 或 `transparent`。桌面平台（macOS/Linux/Windows）推荐 `http`，可直接配合系统/全局代理；`transparent` 仅用于 Android Magisk 模块，且必须只有一个 `127.0.0.1` 监听地址。 |
 | `proxy` | `listen` | 是 | — | 监听地址数组，必须是 loopback；端口不能为 0，不能重复。HTTP 模式可同时监听 IPv4/IPv6；`transparent` 只能一个 IPv4 loopback。 |
 | `proxy` | `upstream` | 是 | — | 上游 HTTP 代理地址（CONNECT），不是 SOCKS5。端口不能为 0；不能是 unspecified/multicast/broadcast，也不能等于任一 `listen` 地址。 |
+| `proxy` | `max_connections` | 否 | `4096` | 同时活跃的 TCP 连接/请求上限，必须大于 0。按部署环境的 fd/内存预算调整。 |
+| `proxy` | `idle_timeout_secs` | 否 | `300` | 双向连接无数据多久后回收，必须大于 0；用于清理半关闭连接。 |
 | `rules` | `file` | 是 | — | 最终 `rules.toml` 快照路径；运行时只读。发布包附带一份非个人通用 seed，部署方可用自己的最终快照替换。 |
 | `rules` | `reload` | 否 | `true` | 监听 `rules.file` 变化并热加载；失败保留旧快照，按退避重试。设为 `false` 时需重启进程。 |
 | `logging` | `file` | 是 | — | 日志文件路径；按大小轮转。 |
@@ -65,7 +69,7 @@ keep = 3
 - 路径建议使用绝对路径；相对路径按进程当前目录解析。
 - `transparent` 借 Linux/Android 透明重定向工作；实际只给 Android Magisk 模块使用。Linux 虽然技术上可用，但推荐 `http` + 全局代理，macOS/Windows 只能使用 `http`。
 - `transparent` 只对 80 端口的明文 HTTP 读取 `Host`；HTTPS 不解析 SNI，按目标 IP 决策。80 端口可用显式 Direct `Host` 把 foreign IP 提升为直连；HTTPS 仍无法做到这一点。若某个代理域名解析到直连 IP，HTTPS 请求仍会走直连，这是当前版本的已知边界，不是规则失效。
-- HTTP 模式最多 1024 个连接槽、512 个活跃请求/隧道；响应头返回后释放活跃请求许可，慢速下载只占连接槽。`100.64.0.0/10`（CGNAT/Tailscale）按私有地址直连。
+- HTTP 模式的连接槽为 `max_connections + 1024`，活跃请求/隧道上限为 `max_connections`；响应头返回后释放活跃请求许可，慢速下载只占连接槽。`100.64.0.0/10`（CGNAT/Tailscale）按私有地址直连。
 - 域名规则是后缀匹配；只写 `com` 会匹配所有 `.com` 域名，这是预期语义，`rules check` 不会把它当错误。
 
 ## 规则文件
@@ -84,7 +88,7 @@ cp rules.toml /path/to/routeproxy/rules.toml
 routeproxy rules check --file /path/to/rules.toml
 ```
 
-0.1.1 起校验更严格：域名不接受 `_`、空标签或连续点，CIDR 不接受尾点；旧快照如有这些写法，需要先修正。
+0.1.2 起校验更严格：域名不接受 `_`、空标签或连续点，CIDR 不接受尾点；旧快照如有这些写法，需要先修正。
 
 `rules check` 只校验 schema、`upstream_sha`、域名/CIDR 格式和时间戳，不检查数量下限、哨兵或文件大小；成功时输出：
 
@@ -164,7 +168,7 @@ routeproxy version
 `version` 输出类似：
 
 ```text
-routeproxy 0.1.1 (routeproxy-build-id:0.1.1@<commit>|)
+routeproxy 0.1.2 (routeproxy-build-id:0.1.2@<commit>|)
 ```
 
 ## 来源与许可

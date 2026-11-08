@@ -5,23 +5,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, timeout_at};
 
 use crate::config::Config;
 use crate::engine::{Decision, Engine};
+use crate::http::bind_listeners;
 use crate::http::connect::connect_via_proxy;
-use crate::http::{bind_listeners, MAX_ACTIVE_CONNECTIONS};
 use crate::platform::original_dst;
+use crate::relay::copy_bidirectional_idle;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_SNIFF_BYTES: usize = 16 * 1024;
 
 pub async fn serve(config: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
-    let permits = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
+    let permits = Arc::new(Semaphore::new(config.max_connections()));
     let mut listeners = bind_listeners(&config, "transparent").await?;
     if listeners.len() != 1 {
         bail!("transparent 模式要求恰好一个监听器");
@@ -191,7 +191,8 @@ async fn handle_connection(
         "transparent TCP 已建立"
     );
 
-    if let Err(error) = copy_bidirectional(&mut client, &mut upstream).await {
+    let idle_timeout = config.idle_timeout();
+    if let Err(error) = copy_bidirectional_idle(&mut client, &mut upstream, idle_timeout).await {
         tracing::debug!("transparent TCP 已关闭: {error}");
     }
 }
