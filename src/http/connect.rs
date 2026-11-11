@@ -13,6 +13,8 @@ use tokio::time::timeout;
 use crate::config::Config;
 use crate::engine::{Decision, Engine};
 use crate::relay::copy_bidirectional_idle;
+use crate::socks5;
+use crate::upstream::TcpUpstream;
 
 use super::proxy::connect_direct;
 use super::{error_response, full_body, host_header, normalize_authority_host, BoxBody};
@@ -33,7 +35,10 @@ pub async fn handle(
     };
     let (host, port) =
         normalize_authority_host(authority.host(), authority.port_u16().unwrap_or(443));
-    let resolution = engine.resolve_host(&host).await;
+    let mut resolution = engine.resolve_host(&host).await;
+    if config.is_excluded_port(port) {
+        resolution.decision = Decision::Direct;
+    }
     let decision = resolution.decision;
     let on_upgrade = hyper::upgrade::on(&mut req);
 
@@ -62,6 +67,7 @@ pub async fn handle(
         }
     };
 
+    let idle_timeout = config.idle_timeout();
     tokio::spawn(async move {
         let _permit = permit;
         let upgraded = match on_upgrade.await {
@@ -72,8 +78,7 @@ pub async fn handle(
             }
         };
         let mut client = TokioIo::new(upgraded);
-        if let Err(error) =
-            copy_bidirectional_idle(&mut client, &mut upstream, config.idle_timeout()).await
+        if let Err(error) = copy_bidirectional_idle(&mut client, &mut upstream, idle_timeout).await
         {
             tracing::debug!("CONNECT 隧道关闭: {error}");
         }
@@ -97,26 +102,32 @@ pub async fn handle(
 }
 
 pub(crate) async fn connect_via_proxy(host: &str, port: u16, config: &Config) -> Result<TcpStream> {
-    let upstream = config.upstream_addr();
-    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream))
-        .await
-        .context("连接上游超时")?
-        .with_context(|| format!("连接上游 {upstream} 失败"))?;
+    match config.tcp_upstream() {
+        TcpUpstream::Socks5(upstream) => {
+            return socks5::connect_tcp(upstream, host, port).await;
+        }
+        TcpUpstream::Http(upstream) => {
+            let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream))
+                .await
+                .context("连接上游超时")?
+                .with_context(|| format!("连接上游 {upstream} 失败"))?;
 
-    let authority = host_header(host, port);
-    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
-    timeout(IO_TIMEOUT, stream.write_all(request.as_bytes()))
-        .await
-        .context("发送上游 CONNECT 超时")?
-        .context("发送上游 CONNECT 失败")?;
+            let authority = host_header(host, port);
+            let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+            timeout(IO_TIMEOUT, stream.write_all(request.as_bytes()))
+                .await
+                .context("发送上游 CONNECT 超时")?
+                .context("发送上游 CONNECT 失败")?;
 
-    let status = timeout(IO_TIMEOUT, read_status(&mut stream))
-        .await
-        .context("读取上游 CONNECT 响应超时")??;
-    if !(200..300).contains(&status) {
-        bail!("上游 CONNECT 返回 HTTP {status}");
+            let status = timeout(IO_TIMEOUT, read_status(&mut stream))
+                .await
+                .context("读取上游 CONNECT 响应超时")??;
+            if !(200..300).contains(&status) {
+                bail!("上游 CONNECT 返回 HTTP {status}");
+            }
+            Ok(stream)
+        }
     }
-    Ok(stream)
 }
 
 async fn read_status(stream: &mut TcpStream) -> Result<u16> {

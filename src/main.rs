@@ -8,7 +8,10 @@ mod net;
 mod platform;
 mod relay;
 mod rules;
+mod socks5;
 mod transparent;
+mod udp;
+mod upstream;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -136,6 +139,12 @@ fn run_proxy(config_path: &Path, log_level: Option<&str>) -> Result<()> {
         config.logging.max_size_mb,
         config.logging.keep,
     )?;
+    if config.udp_enabled() && !config.is_excluded_port(53) {
+        tracing::warn!(
+            event = "udp_dns_warning",
+            "udp.enabled = true，但 routing.exclude_ports 未包含 53；请确认防火墙在 TPROXY 前排除 DNS"
+        );
+    }
     let reload = config.rules.reload;
     let mode = config.proxy.mode;
 

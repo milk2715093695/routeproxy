@@ -1,9 +1,9 @@
 [package]
 name = "routeproxy"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "面向 Android/Magisk 与桌面平台的轻量 HTTP/透明 TCP 代理"
+description = "面向 Android/Magisk 与桌面平台的轻量 HTTP/透明 TCP/UDP 代理"
 license = "Apache-2.0"
 repository = "https://github.com/milk2715093695/routeproxy"
 

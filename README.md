@@ -1,6 +1,6 @@
 # routeproxy
 
-`routeproxy` 是一个 TCP 转发代理，旨在根据规则自动决定直连还是使用上游代理。
+`routeproxy` 是一个 HTTP/透明 TCP/UDP 转发代理，根据规则自动决定直连还是使用上游代理。透明 UDP 支持 Linux/Android 的 IPv4 ingress，当前只在 Android 验收。
 
 ## 目录
 
@@ -33,7 +33,7 @@ Android 交叉编译、macOS/Termux/Windows 打包脚本在 `packaging/` 下。
 [proxy]
 mode = "http"
 listen = ["127.0.0.1:6045", "[::1]:6045"]
-upstream = "127.0.0.1:9910"
+upstream = "http://127.0.0.1:9910"
 max_connections = 4096
 idle_timeout_secs = 300
 
@@ -54,9 +54,14 @@ keep = 3
 | --- | --- | --- | --- | --- |
 | `proxy` | `mode` | 是 | — | `http` 或 `transparent`。桌面平台（macOS/Linux/Windows）推荐 `http`，可直接配合系统/全局代理；`transparent` 仅用于 Android Magisk 模块，且必须只有一个 `127.0.0.1` 监听地址。 |
 | `proxy` | `listen` | 是 | — | 监听地址数组，必须是 loopback；端口不能为 0，不能重复。HTTP 模式可同时监听 IPv4/IPv6；`transparent` 只能一个 IPv4 loopback。 |
-| `proxy` | `upstream` | 是 | — | 上游 HTTP 代理地址（CONNECT），不是 SOCKS5。端口不能为 0；不能是 unspecified/multicast/broadcast，也不能等于任一 `listen` 地址。 |
-| `proxy` | `max_connections` | 否 | `4096` | 同时活跃的 TCP 连接/请求上限，必须大于 0。按部署环境的 fd/内存预算调整。 |
-| `proxy` | `idle_timeout_secs` | 否 | `300` | 双向连接无数据多久后回收，必须大于 0；用于清理半关闭连接。 |
+| `proxy` | `upstream` | 是 | — | TCP 上游。支持 `http://host:port`（HTTP CONNECT）和 `socks5://host:port`（SOCKS5 CONNECT）；`http` 模式只允许 HTTP 上游，SOCKS5 用于 `transparent`。裸 `host:port` 按 HTTP 处理。端口不能为 0；不能是 unspecified/multicast/broadcast，也不能等于任一 `listen` 地址。 |
+| `proxy` | `udp_upstream` | 否 | — | UDP 上游，只接受 `socks5://host:port`；`udp.enabled = true` 时必填。UDP 不复用 HTTP CONNECT。 |
+| `proxy` | `max_connections` | 否 | `4096` | 同时活跃的 TCP 连接/请求上限；透明模式每个连接占客户端和上游两个 fd，需同时确认进程 `ulimit -n`。 |
+| `proxy` | `idle_timeout_secs` | 否 | `300` | 双向连接无数据多久后回收；用于回收半关闭或长期空闲的隧道，必须大于 0。 |
+| `routing` | `exclude_ports` | 否 | `[]` | 目标端口排除列表，TCP/UDP 都生效，离散 `u16` 去重。被排除端口按直连处理。DNS 53 必须在这里或防火墙中排除。 |
+| `udp` | `enabled` | 否 | `false` | 是否启动透明 UDP ingress；要求 `proxy.mode = "transparent"` 且配置 `udp_upstream`。 |
+| `udp` | `default` | 否 | `"proxy"` | 当 IP 规则判为代理时，UDP 的动作：`proxy`、`direct` 或 `reject`。 |
+| `udp` | `reject_ports` | 否 | `[]` | UDP 专用拒绝端口，不能与 `routing.exclude_ports` 重叠；公共 Geph exit 建议显式加入 `443`。 |
 | `rules` | `file` | 是 | — | 最终 `rules.toml` 快照路径；运行时只读。发布包附带一份非个人通用 seed，部署方可用自己的最终快照替换。 |
 | `rules` | `reload` | 否 | `true` | 监听 `rules.file` 变化并热加载；失败保留旧快照，按退避重试。设为 `false` 时需重启进程。 |
 | `logging` | `file` | 是 | — | 日志文件路径；按大小轮转。 |
@@ -67,10 +72,39 @@ keep = 3
 补充：
 
 - 路径建议使用绝对路径；相对路径按进程当前目录解析。
-- `transparent` 借 Linux/Android 透明重定向工作；实际只给 Android Magisk 模块使用。Linux 虽然技术上可用，但推荐 `http` + 全局代理，macOS/Windows 只能使用 `http`。
+- `transparent` 借 Linux/Android 透明重定向工作；实际只给 Android Magisk 模块使用。Linux 虽然技术上可用，但推荐 `http` + 全局代理，macOS/Windows 只能使用 `http`。透明 UDP 当前只在 Android IPv4 上验收；Linux ingress 代码存在但未作生产验收。
 - `transparent` 只对 80 端口的明文 HTTP 读取 `Host`；HTTPS 不解析 SNI，按目标 IP 决策。80 端口可用显式 Direct `Host` 把 foreign IP 提升为直连；HTTPS 仍无法做到这一点。若某个代理域名解析到直连 IP，HTTPS 请求仍会走直连，这是当前版本的已知边界，不是规则失效。
-- HTTP 模式的连接槽为 `max_connections + 1024`，活跃请求/隧道上限为 `max_connections`；响应头返回后释放活跃请求许可，慢速下载只占连接槽。`100.64.0.0/10`（CGNAT/Tailscale）按私有地址直连。
+- HTTP 模式默认在 `max_connections`（4096）之外保留 1024 个 keep-alive 连接槽，活跃请求/隧道上限同样是 4096；响应头返回后释放活跃请求许可，慢速下载只占连接槽。透明模式每个连接占客户端和上游两个 fd，需同步放宽进程 `ulimit -n`。`100.64.0.0/10`（CGNAT/Tailscale）按私有地址直连。
 - 域名规则是后缀匹配；只写 `com` 会匹配所有 `.com` 域名，这是预期语义，`rules check` 不会把它当错误。
+
+### 透明 UDP（Android）
+
+透明 UDP 与 TCP 分开配置上游；UDP 不能走 HTTP 端口。示例：
+
+```toml
+[proxy]
+mode = "transparent"
+listen = ["127.0.0.1:6045"]
+upstream = "http://127.0.0.1:9910"
+udp_upstream = "socks5://127.0.0.1:9909"
+
+[routing]
+exclude_ports = [53]
+
+[udp]
+enabled = true
+default = "proxy"
+reject_ports = [443]
+```
+
+- 每个 UDP 五元组 flow 使用一个 SOCKS5 UDP association，并复用同一个客户端 UDP 源 socket；不能按数据报重建 association。flow 队列有 64 MiB 全局字节预算，flow 常驻缓冲另有 64 MiB 预算（每 flow 按两块 64 KiB 预留），预算耗尽时丢新数据报/新 flow，不拆已有 flow；单个源 `ip:port`（socket）最多 64 个 flow，全机上限由 512 flow/64 MiB 预算兜底，避免一个 app 占满全机 UDP。
+- UDP 只支持 IPv4；Android 脚本在 `ip6tables` 可用时用 `ROUTEPROXY_UDP6` 拒绝 IPv6 UDP，不回退直连；`ip6tables` 不可用时跳过 IPv6 规则，不阻塞 IPv4。
+- UDP 443（QUIC/HTTP/3）在公共 Geph exit 被硬编码禁止，无法靠 routeproxy 或配置绕过。默认 Android 示例把 443 放入 `reject_ports`，让浏览器回落 TCP；需要真实 QUIC 时必须换支持 UDP 443 的上游。
+- `routing.exclude_ports` 和防火墙都要在 TPROXY 前排除 DNS 53；否则 DNS 会被透明 UDP 截走。smartdns 仍是唯一解析器。
+- `udp.enabled = true` 时若未排除 53，启动会记录 warning；不会自动改写规则或防火墙。
+- `udp.reject_ports` 在数据面静默丢弃匹配 flow，不回 ICMP；安装失败时的 IPv4/IPv6 fail-closed 链都用 `DROP`，避免依赖 Android 上不保证存在的 `REJECT` target。IPv4 fail-closed 保证不回退直连；IPv6 仅在 `ip6tables` 可用时安装，失败会记录日志。
+- Android 的 `setup_udp_iptables` 使用独立 `ROUTEPROXY_UDP` mangle 链、高位 `mark 0x40000000`、模块专属 `ip rule table 21072` 和 `TPROXY`；不要和 TCP 的 `ROUTEPROXY_TP` nat 链混用。UDP 链安装失败时保留 TCP，并安装 `ROUTEPROXY_UDP_FAIL` / `ROUTEPROXY_UDP_FAIL_FWD` fail-closed，避免 UDP 退回直连。
+- 当前没有 IPv6 UDP ingress；启用 UDP 时脚本用 `ROUTEPROXY_UDP6` filter 链拒绝 IPv6 UDP（回环、link-local、multicast、root、UDP 53 除外），避免 IPv6 流量绕过 IPv4-only 的 TPROXY。UDP 规则安装失败时同样安装 `ROUTEPROXY_UDP6_FAIL` fail-closed。IPv6-only 网络或依赖 IPv6 UDP 的应用应关闭 `udp.enabled`。
 
 ## 规则文件
 
@@ -88,7 +122,7 @@ cp rules.toml /path/to/routeproxy/rules.toml
 routeproxy rules check --file /path/to/rules.toml
 ```
 
-0.1.2 起校验更严格：域名不接受 `_`、空标签或连续点，CIDR 不接受尾点；旧快照如有这些写法，需要先修正。
+规则校验不接受 `_`、空标签或连续点；CIDR 不接受尾点。
 
 `rules check` 只校验 schema、`upstream_sha`、域名/CIDR 格式和时间戳，不检查数量下限、哨兵或文件大小；成功时输出：
 
@@ -168,7 +202,7 @@ routeproxy version
 `version` 输出类似：
 
 ```text
-routeproxy 0.1.2 (routeproxy-build-id:0.1.2@<commit>|)
+routeproxy <version> (routeproxy-build-id:<version>@<commit>|)
 ```
 
 ## 来源与许可
@@ -201,7 +235,7 @@ routeproxy doctor --config /path/to/config.toml
 - Linux：可执行文件放到 `/usr/local/bin`；配置可放 `/etc/routeproxy/config.toml` 或用户目录；由 systemd 或用户服务托管。推荐 `mode = "http"` 并配合系统/全局代理。
 - Termux：解压 aarch64 包，配置放到 `~/.config/routeproxy/config.toml`；由 runit 服务托管。
 - Windows：安装 `routeproxy.exe`，配置放到 `%USERPROFILE%\.config\routeproxy\config.toml`；由计划任务托管。
-- Android：使用 Magisk 模块；配置在 `/data/adb/routeproxy/config.toml`，规则在 `/data/adb/routeproxy/rules.toml`；模块服务负责启动和透明重定向。
+- Android：使用 Magisk 模块；配置在 `/data/adb/routeproxy/config.toml`，规则在 `/data/adb/routeproxy/rules.toml`；模块服务负责启动和透明重定向。透明 UDP 需要 `udp_upstream = "socks5://..."`，公共 Geph 环境把 `udp.reject_ports` 设为 `[443]`。
 
 启动前确认：
 

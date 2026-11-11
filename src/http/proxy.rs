@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::engine::{Decision, Engine, HostResolution};
 use crate::net::canonicalize_addr;
 use crate::relay::copy_bidirectional_idle;
+use crate::upstream::TcpUpstream;
 
 use super::{
     error_response, full_body, host_header, normalize_authority_host, strip_hop_by_hop, BoxBody,
@@ -148,7 +149,10 @@ pub async fn handle(
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "请求格式错误"),
     };
     let authority = host_header(&host, port);
-    let resolution = engine.resolve_host(&host).await;
+    let mut resolution = engine.resolve_host(&host).await;
+    if config.is_excluded_port(port) {
+        resolution.decision = Decision::Direct;
+    }
     let decision = resolution.decision;
     let level = request_log_level(&host);
 
@@ -288,7 +292,7 @@ async fn forward(
     Ok(timed_response(response))
 }
 
-/// Direct 使用 origin-form；Proxy 使用 absolute-form。
+/// Direct 使用 origin-form；Proxy（仅 HTTP 上游）使用 absolute-form。
 fn rewrite_request_uri(
     parts: &mut http::request::Parts,
     decision: Decision,
@@ -301,14 +305,19 @@ fn rewrite_request_uri(
         .unwrap_or("/")
         .to_owned();
 
-    if decision == Decision::Direct {
-        parts.uri = Uri::builder().path_and_query(path).build()?;
-    } else if parts.uri.scheme().is_none() {
-        parts.uri = Uri::builder()
-            .scheme("http")
-            .authority(authority)
-            .path_and_query(path)
-            .build()?;
+    match decision {
+        Decision::Direct => {
+            parts.uri = Uri::builder().path_and_query(path).build()?;
+        }
+        Decision::Proxy => {
+            if parts.uri.scheme().is_none() {
+                parts.uri = Uri::builder()
+                    .scheme("http")
+                    .authority(authority)
+                    .path_and_query(path)
+                    .build()?;
+            }
+        }
     }
     Ok(())
 }
@@ -451,9 +460,32 @@ async fn connect_addresses(
 }
 
 async fn connect_upstream(config: &Config) -> Result<TcpStream> {
-    let address = config.upstream_addr();
+    let TcpUpstream::Http(address) = config.tcp_upstream() else {
+        bail!("HTTP 模式只允许 HTTP TCP 上游");
+    };
     timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
         .await
         .context("连接上游超时")?
         .with_context(|| format!("连接上游 {address} 失败"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts(uri: &str) -> http::request::Parts {
+        http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0
+    }
+
+    #[test]
+    fn http_proxy_builds_absolute_form() {
+        let mut parts = parts("/a?q=1");
+        rewrite_request_uri(&mut parts, Decision::Proxy, "example.com").unwrap();
+        assert_eq!(parts.uri.to_string(), "http://example.com/a?q=1");
+    }
 }

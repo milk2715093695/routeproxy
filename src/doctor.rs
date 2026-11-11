@@ -48,7 +48,19 @@ pub fn run(config_path: &Path, probe: Option<&str>) -> Result<()> {
     let config = Config::load(config_path)?;
     println!("配置: {}", config_path.display());
     println!("模式: {}", mode_name(config.proxy.mode));
-    println!("上游: {}", config.proxy.upstream);
+    println!(
+        "TCP 上游: {}://{}",
+        config.tcp_upstream().scheme(),
+        config.tcp_upstream_addr()
+    );
+    if config.udp_enabled() {
+        println!(
+            "UDP 上游: socks5://{}（已启用）",
+            config.udp_upstream_addr().expect("udp.enabled 已验证上游")
+        );
+    } else {
+        println!("UDP: 未启用");
+    }
     println!("规则: {}", config.rules.file.display());
     println!("热加载: {}", config.rules.reload);
     println!(
@@ -79,7 +91,7 @@ pub fn run(config_path: &Path, probe: Option<&str>) -> Result<()> {
     }
     drop(listeners);
 
-    let upstream = config.upstream_addr();
+    let upstream = config.tcp_upstream_addr();
     match TcpStream::connect_timeout(&upstream, Duration::from_secs(3)) {
         Ok(stream) => {
             drop(stream);

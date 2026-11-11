@@ -30,8 +30,22 @@ pub async fn serve(config: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
         .pop()
         .expect("transparent 配置已校验只有一个监听器");
 
-    accept_loop(listener, config, engine, permits)
-        .await
+    let tcp = accept_loop(listener, Arc::clone(&config), Arc::clone(&engine), permits);
+    if config.udp_enabled() {
+        // UDP 是附加数据面：UDP ingress 失败不能带走 TCP 监听。
+        let udp_config = Arc::clone(&config);
+        let udp_engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            if let Err(error) = crate::udp::serve(udp_config, udp_engine).await {
+                tracing::error!(
+                    event = "udp_serve",
+                    error = %format!("{error:#}"),
+                    "UDP 服务已退出，TCP 继续运行"
+                );
+            }
+        });
+    }
+    tcp.await
         .with_context(|| format!("transparent 监听 {address} 已停止"))
 }
 
@@ -91,8 +105,7 @@ async fn handle_connection(
         }
     };
 
-    // 直接连到本代理监听器（例如 watchdog 健康探测）没有原始目标可转发。
-    // 若按普通直连处理，会再连回本监听器，形成无界反馈环。
+    // 连到本监听器会再次进入透明代理，必须拒绝以免形成反馈环。
     if config.is_forbidden_target(target.into()) {
         tracing::debug!(
             event = "transparent_tcp",
@@ -108,9 +121,7 @@ async fn handle_connection(
     }
 
     let ip_decision = engine.decide_ip(IpAddr::V4(*target.ip())).await;
-    // 80 端口优先读取明文 Host：既允许 Direct IP 被域名规则升级为 Proxy，
-    // 也允许 foreign IP 上的显式 Direct 域名走直连。非 80 端口（尤其 TLS）
-    // 不等待客户端请求，继续按 IP 决策。
+    // 只有 80 端口能读明文 Host；非 80 端口不等待客户端数据，按 IP 决策。
     let mut sniff_failed = false;
     let http_host = if target.port() == 80 {
         match peek_http_host(&client).await {
@@ -124,12 +135,15 @@ async fn handle_connection(
     } else {
         None
     };
-    let decision = match http_host.as_deref() {
-        Some(host) => combine_decisions(ip_decision, engine.decide_host(host).await),
-        // 看起来像 HTTP、但始终没有完整 header 的请求不能回退到 Direct IP
-        // 决策；否则慢速或畸形客户端会绕过域名规则。
-        None if sniff_failed => Decision::Proxy,
-        None => ip_decision,
+    let decision = if config.is_excluded_port(target.port()) {
+        Decision::Direct
+    } else {
+        match http_host.as_deref() {
+            Some(host) => combine_decisions(ip_decision, engine.decide_host(host).await),
+            // 已确认是 HTTP 但 header 不完整时不能回退 Direct IP，否则可绕过域名规则。
+            None if sniff_failed => Decision::Proxy,
+            None => ip_decision,
+        }
     };
 
     let mut upstream = match decision {
@@ -191,8 +205,9 @@ async fn handle_connection(
         "transparent TCP 已建立"
     );
 
-    let idle_timeout = config.idle_timeout();
-    if let Err(error) = copy_bidirectional_idle(&mut client, &mut upstream, idle_timeout).await {
+    if let Err(error) =
+        copy_bidirectional_idle(&mut client, &mut upstream, config.idle_timeout()).await
+    {
         tracing::debug!("transparent TCP 已关闭: {error}");
     }
 }
@@ -220,7 +235,7 @@ fn log_transparent_failure(
 
 fn combine_decisions(ip: Decision, host: Decision) -> Decision {
     match (ip, host) {
-        // 域名可将 Direct IP 升级为 Proxy，也可让 foreign IP 上的 Direct 域名直连。
+        // 域名可把 Direct IP 升级为 Proxy，也可让 foreign IP 上的 Direct 域名直连。
         (Decision::Direct, Decision::Proxy) => Decision::Proxy,
         (Decision::Proxy, Decision::Direct) | (Decision::Direct, Decision::Direct) => {
             Decision::Direct
@@ -232,10 +247,10 @@ fn combine_decisions(ip: Decision, host: Decision) -> Decision {
 async fn peek_http_host(stream: &TcpStream) -> io::Result<Option<String>> {
     let deadline = tokio::time::Instant::now() + SNIFF_TIMEOUT;
     let mut buffer = [0_u8; MAX_SNIFF_BYTES];
-    let mut filled = 0;
 
     loop {
-        let read = match timeout_at(deadline, stream.peek(&mut buffer[filled..])).await {
+        // peek 每次从流起点返回可读字节，不能把偏移当累计长度。
+        let read = match timeout_at(deadline, stream.peek(&mut buffer)).await {
             Ok(result) => result?,
             Err(_) => {
                 return Err(io::Error::new(
@@ -247,9 +262,8 @@ async fn peek_http_host(stream: &TcpStream) -> io::Result<Option<String>> {
         if read == 0 {
             return Ok(None);
         }
-        filled += read;
 
-        let bytes = &buffer[..filled];
+        let bytes = &buffer[..read];
         match classify_http_prefix(bytes) {
             HttpPrefix::NotHttp => return Ok(None),
             HttpPrefix::Incomplete => {}
@@ -259,14 +273,14 @@ async fn peek_http_host(stream: &TcpStream) -> io::Result<Option<String>> {
                 }
             }
         }
-        if filled == buffer.len() {
+        if read == buffer.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "HTTP header 超过嗅探缓冲区",
             ));
         }
 
-        // peek 不消费字节；给客户端短窗口补齐跨 TCP 段的 header。
+        // peek 不消费字节，给客户端时间补齐跨 TCP 段的 header。
         sleep(Duration::from_millis(10)).await;
     }
 }

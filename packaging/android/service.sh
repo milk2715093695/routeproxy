@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Magisk late_start 会无参数调用；编辑 /data/adb/routeproxy/config.toml 后，
-# 可手动使用 start 或 stop。
+# Magisk late_start 无参数调用；也可手动执行 start/stop。
 
 MODDIR=${0%/*}
 DATA=/data/adb/routeproxy
@@ -14,12 +13,18 @@ LOG="$DATA/logs/service.log"
 
 unset LD_PRELOAD
 mkdir -p "$DATA/logs"
+# 放宽 fd 上限；失败时保留系统默认值，不阻止启动。
+if ! ulimit -n 65536 2>/dev/null; then
+    if ! ulimit -n 16384 2>/dev/null; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') service: 无法提高 fd 上限，当前 $(ulimit -n)" >> "$LOG" 2>/dev/null || true
+    fi
+fi
 . "$MODDIR/scripts/common.sh"
 
 log() {
     _msg="$(date '+%Y-%m-%d %H:%M:%S') service: $*"
     echo "$_msg" >> "$LOG"
-    # Magisk 调用 service.sh 时没有终端；保留手动运行的可见输出。
+    # Magisk 调用时没有终端；手动运行时仍输出到 stderr。
     if [ -t 2 ]; then
         echo "routeproxy-tp: $*" >&2
     fi
@@ -53,8 +58,7 @@ stop_watchdog() {
             i=$((i + 1))
         done
         kill -9 "$pid" 2>/dev/null
-        # 只有在旧 watchdog 确实退出后才清锁/pid；提前清锁会让两个
-        # supervisor 同时存在。
+        # 旧 watchdog 退出后才清锁/pid，避免两个 supervisor 同时存在。
         if kill -0 "$pid" 2>/dev/null; then
             return 0
         fi
@@ -67,6 +71,20 @@ stop_proxy() {
     stop_pid "$PIDFILE" "$BIN" run "$CONF"
 }
 
+# 启动失败时保留 UDP fail-closed；仅 UDP 未启用才彻底拆除规则。
+cleanup_start_failure() {
+    stop_proxy
+    if [ "${udp_enabled:-0}" = "1" ]; then
+        remove_iptables_keep_udp_fail_closed
+        # setup_udp_iptables 可能已移除 fail-closed，这里重新装回。
+        if ! install_udp_fail_closed; then
+            log "启动失败后 UDP fail-closed 安装失败，请检查 iptables"
+        fi
+    else
+        remove_iptables
+    fi
+}
+
 start_service() {
     if [ ! -x "$BIN" ]; then
         log "可执行文件缺失: $BIN"
@@ -76,46 +94,79 @@ start_service() {
         log "配置文件缺失: $CONF"
         return 1
     fi
-
-    # 连接上限接近默认值时，fd 预算必须留出余量。
-    ulimit -n 65536 2>/dev/null || ulimit -n 16384 2>/dev/null || log "无法提高 fd 上限"
-
     PORT="$(read_port "$CONF")" || {
         log "监听地址无效: $CONF"
         return 1
     }
 
+    udp_enabled=0
+    read_udp_enabled "$CONF" && udp_enabled=1
+
     stop_watchdog
     stop_proxy
-    remove_iptables
+    if [ "$udp_enabled" = "1" ]; then
+        # 先装 fail-closed 再拆旧 TPROXY，避免重启窗口内 UDP 直连。
+        if ! install_udp_fail_closed; then
+            log "UDP fail-closed 安装失败，拒绝启动以免 UDP 直连"
+            return 1
+        fi
+        remove_iptables_keep_udp_fail_closed
+    else
+        remove_iptables
+    fi
 
     setsid sh -c 'echo $$ > "$1"; exec "$2" run --config "$3"' sh \
         "$PIDFILE" "$BIN" "$CONF" >> "$DATA/logs/stdout.log" 2>&1 &
-    sleep 1
-    pid="$(read_pid "$PIDFILE")"
+    # pidfile 由子 shell 写入；不要用固定 1 秒赌它已经落盘。
+    _wait=0
+    while [ "$_wait" -lt 10 ]; do
+        pid="$(read_pid "$PIDFILE")"
+        is_routeproxy_pid "$pid" && break
+        sleep 0.2
+        _wait=$((_wait + 1))
+    done
     if ! is_routeproxy_pid "$pid"; then
         log "routeproxy 启动失败 (pid=${pid:-无})"
-        stop_proxy
-        remove_iptables
+        cleanup_start_failure
         return 1
     fi
 
     if ! setup_iptables; then
         log "iptables 设置失败，停止 routeproxy"
-        stop_proxy
-        remove_iptables
+        cleanup_start_failure
         return 1
+    fi
+
+    if [ "$udp_enabled" = "1" ]; then
+        if ! wait_udp_port "$PORT" "$pid"; then
+            # TCP 已建立；UDP 独立失败不拆 TCP，但不能 TPROXY 到无 listener 的端口。
+            log "UDP ingress 未监听，安装 UDP fail-closed；TCP 继续"
+            if ! install_udp_fail_closed; then
+                log "UDP fail-closed 也失败，请检查 iptables"
+            fi
+        elif ! setup_udp_iptables; then
+            log "UDP iptables 设置失败，安装 UDP fail-closed；TCP 继续"
+            if ! install_udp_fail_closed; then
+                log "UDP fail-closed 也失败，请检查 iptables"
+            fi
+        else
+            log "UDP 透明链已启用 port=$PORT"
+        fi
     fi
 
     if [ "${ROUTEPROXY_NO_WATCHDOG:-0}" != "1" ]; then
         setsid /system/bin/sh "$WATCHDOG_SCRIPT" >> "$DATA/logs/watchdog.log" 2>&1 &
-        sleep 1
-        watchdog="$(read_pid "$WATCHDOG_PID")"
+        _wait=0
+        while [ "$_wait" -lt 10 ]; do
+            watchdog="$(read_pid "$WATCHDOG_PID")"
+            is_watchdog_pid "$watchdog" && break
+            sleep 0.2
+            _wait=$((_wait + 1))
+        done
         if ! is_watchdog_pid "$watchdog"; then
             log "watchdog 启动失败"
             stop_watchdog
-            stop_proxy
-            remove_iptables
+            cleanup_start_failure
             return 1
         fi
     fi

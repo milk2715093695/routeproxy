@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# 用 PID 文件和精确路径保持 daemon/iptables，不用可能误杀 ssh 的 pkill。
+# 用 PID 文件和精确路径维护 daemon/iptables，避免 pkill 误杀 ssh。
 
 MODDIR=${0%/*}
 MODROOT=${MODDIR%/*}
@@ -58,9 +58,7 @@ daemon_alive() {
 }
 
 port_open() {
-    # 不要用 nc/curl 探测：到 transparent 监听器的 TCP 连接本身会被
-    # routeproxy 接受，形成自转发环。要求 /proc/net/tcp 中存在 LISTEN
-    # (st=0A)，而不是仅有本地端点为 127.0.0.1:6045 的连接。
+    # 不用 nc/curl 探测，避免自转发环；只查 /proc/net/tcp 的 LISTEN。
     hex="$(printf '%04X' "$1")"
     awk -v want="0100007F:$hex" '
         $2 == want && $4 == "0A" { found = 1 }
@@ -69,16 +67,60 @@ port_open() {
 }
 
 ensure_iptables() {
-    if iptables -w -t nat -C OUTPUT -p tcp -j "$CHAIN" 2>/dev/null \
-        && iptables -w -t nat -C "$CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
-        && iptables -w -t nat -C "$CHAIN" -m owner --uid-owner 0 -j RETURN 2>/dev/null \
-        && iptables -w -t nat -C "$CHAIN" -p tcp --dport 53 -j RETURN 2>/dev/null \
-        && iptables -w -t nat -C "$CHAIN" -p tcp -j REDIRECT --to-ports "$PORT" 2>/dev/null; then
+    if iptables -w 5 -t nat -C OUTPUT -p tcp -j "$CHAIN" 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -m owner --uid-owner 0 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -p tcp --dport 53 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -p tcp -j REDIRECT --to-ports "$PORT" 2>/dev/null; then
         return 0
     fi
 
     setup_iptables || return 1
     log "已重新添加 iptables $CHAIN port=$PORT"
+}
+
+ensure_udp_iptables() {
+    _udp6_ok=1
+    if command -v ip6tables >/dev/null 2>&1 && ip6tables -w 5 -L OUTPUT >/dev/null 2>&1; then
+        ip6tables -w 5 -t filter -C OUTPUT -p udp -j "$UDP6_CHAIN" 2>/dev/null \
+            && ip6tables -w 5 -t filter -C FORWARD -p udp -j "$UDP6_CHAIN" 2>/dev/null \
+            && ip6tables -w 5 -t filter -C "$UDP6_CHAIN" -p udp -j DROP 2>/dev/null \
+            || _udp6_ok=0
+    fi
+
+    if ip rule show 2>/dev/null | grep -Eq "fwmark $UDP_MARK(/[^ ]+)?[[:space:]].*lookup $UDP_TABLE([[:space:]]|$)" \
+        && ip route show table "$UDP_TABLE" 2>/dev/null \
+            | grep -Eq '^local[[:space:]]+0\.0\.0\.0/0[[:space:]]+dev[[:space:]]+lo' \
+        && iptables -w 5 -t mangle -C OUTPUT -p udp -j "$UDP_OUT_CHAIN" 2>/dev/null \
+        && iptables -w 5 -t mangle -C PREROUTING -p udp -m mark --mark "$UDP_MARK/$UDP_MARK" \
+            -j "$UDP_CHAIN" 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 224.0.0.0/4 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 255.255.255.255/32 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 169.254.0.0/16 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -p udp --dport 53 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -p udp \
+            -j TPROXY --on-port "$PORT" --tproxy-mark "$UDP_MARK/$UDP_MARK" 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 224.0.0.0/4 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 255.255.255.255/32 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 169.254.0.0/16 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -m owner --uid-owner 0 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -p udp --dport 53 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -p udp \
+            -j MARK --set-mark "$UDP_MARK/$UDP_MARK" 2>/dev/null \
+        && [ "$_udp6_ok" = "1" ]; then
+        return 0
+    fi
+
+    if setup_udp_iptables; then
+        log "已重新添加 UDP iptables $UDP_CHAIN port=$PORT"
+        return 0
+    fi
+    install_udp_fail_closed || log "UDP fail-closed 安装失败"
+    return 1
 }
 
 tries=0
@@ -93,6 +135,34 @@ while true; do
 
     if daemon_alive "$PID" && port_open "$PORT"; then
         ensure_iptables || log "iptables 修复失败"
+        if read_udp_enabled "$CONF"; then
+            if udp_port_open "$PORT" "$PID"; then
+                ensure_udp_iptables || log "UDP iptables 修复失败"
+            else
+                # ingress 不属于本 daemon：拆 TPROXY、装 fail-closed，不自动重启。
+                remove_udp_partial
+                _fail_ready=1
+                iptables -w 5 -t filter -C OUTPUT -p udp -j "$UDP_FAIL_CHAIN" 2>/dev/null \
+                    && iptables -w 5 -t filter -C "$UDP_FAIL_CHAIN" -p udp -j DROP 2>/dev/null \
+                    || _fail_ready=0
+                iptables -w 5 -t filter -C FORWARD -p udp -j "$UDP_FAIL_FWD_CHAIN" 2>/dev/null \
+                    && iptables -w 5 -t filter -C "$UDP_FAIL_FWD_CHAIN" -p udp -j DROP 2>/dev/null \
+                    || _fail_ready=0
+                if command -v ip6tables >/dev/null 2>&1 \
+                    && ip6tables -w 5 -L OUTPUT >/dev/null 2>&1; then
+                    ip6tables -w 5 -t filter -C OUTPUT -p udp -j "$UDP6_FAIL_CHAIN" 2>/dev/null \
+                        && ip6tables -w 5 -t filter -C "$UDP6_FAIL_CHAIN" -p udp -j DROP 2>/dev/null \
+                        || _fail_ready=0
+                    ip6tables -w 5 -t filter -C FORWARD -p udp -j "$UDP6_FAIL_FWD_CHAIN" 2>/dev/null \
+                        && ip6tables -w 5 -t filter -C "$UDP6_FAIL_FWD_CHAIN" -p udp -j DROP 2>/dev/null \
+                        || _fail_ready=0
+                fi
+                if [ "$_fail_ready" = "0" ]; then
+                    log "UDP ingress 未监听，安装 fail-closed (port=$PORT)"
+                    install_udp_fail_closed || log "UDP fail-closed 安装失败"
+                fi
+            fi
+        fi
         tries=0
         continue
     fi
@@ -106,8 +176,7 @@ while true; do
         continue
     fi
 
-    # 只启动 daemon 和 iptables；本 watchdog 继续运行。不要走 service.sh
-    # 的常规 watchdog 重启路径，否则启动失败时设备可能没有 supervisor。
+    # 只启动 daemon 和 iptables；本 watchdog 继续运行。
     if ROUTEPROXY_NO_WATCHDOG=1 "$SERVICE" start \
         >> "$DATA/logs/service.log" 2>&1; then
         log "重启成功"
