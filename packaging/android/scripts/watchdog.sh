@@ -11,6 +11,7 @@ CHAIN=ROUTEPROXY_TP
 PIDFILE="$DATA/routeproxy.pid"
 WATCHDOG_PID="$DATA/watchdog.pid"
 LOCK="$DATA/watchdog.lock"
+STOP_FLAG="$DATA/stop.requested"
 LOG="$DATA/logs/watchdog.log"
 
 unset LD_PRELOAD
@@ -80,52 +81,77 @@ ensure_iptables() {
 }
 
 ensure_udp_iptables() {
-    _udp6_ok=1
-    if command -v ip6tables >/dev/null 2>&1 && ip6tables -w 5 -L OUTPUT >/dev/null 2>&1; then
-        ip6tables -w 5 -t filter -C OUTPUT -p udp -j "$UDP6_CHAIN" 2>/dev/null \
-            && ip6tables -w 5 -t filter -C FORWARD -p udp -j "$UDP6_CHAIN" 2>/dev/null \
-            && ip6tables -w 5 -t filter -C "$UDP6_CHAIN" -p udp -j DROP 2>/dev/null \
-            || _udp6_ok=0
+    if ! udp_nfq_ready; then
+        log "NFQUEUE 未就绪，保持/安装 UDP 兜底"
+        if ! udp_v4_protected_ready; then
+            if ! install_udp_fail_closed_or_443; then
+                log "UDP 兜底规则安装失败，保留现有规则"
+                return 1
+            fi
+        fi
+        if udp_tproxy_active; then
+            if ! install_udp443_drop; then
+                log "UDP 443 降级规则安装失败，保留 NFQUEUE 内核拦截"
+                return 1
+            fi
+        fi
+        # 保留 NFQUEUE 内核拦截；队列无人读取时内核直接丢包，不能拆成本机直连。
+        return 1
+    fi
+    udp_local_state_changed
+    _udp_state=$?
+    if [ "$_udp_state" = "2" ]; then
+        log "读取 UDP 本地地址失败，保持现有规则"
+        return 0
+    fi
+    if [ "$_udp_state" = "0" ]; then
+        if refresh_udp_local_bypass; then
+            log "UDP 本地地址变化，已刷新 bypass"
+            if udp_tproxy_ready; then
+                return 0
+            fi
+            log "UDP 本地 bypass 刷新后规则仍不完整，继续重建"
+        else
+            if ! udp_v4_protected_ready; then
+                log "UDP 无有效保护，安装兜底"
+                install_udp_fail_closed_or_443 || return 1
+                return 0
+            fi
+            log "UDP 本地 bypass 刷新失败，保持现有规则"
+            return 0
+        fi
     fi
 
-    if ip rule show 2>/dev/null | grep -Eq "fwmark $UDP_MARK(/[^ ]+)?[[:space:]].*lookup $UDP_TABLE([[:space:]]|$)" \
-        && ip route show table "$UDP_TABLE" 2>/dev/null \
-            | grep -Eq '^local[[:space:]]+0\.0\.0\.0/0[[:space:]]+dev[[:space:]]+lo' \
-        && iptables -w 5 -t mangle -C OUTPUT -p udp -j "$UDP_OUT_CHAIN" 2>/dev/null \
-        && iptables -w 5 -t mangle -C PREROUTING -p udp -m mark --mark "$UDP_MARK/$UDP_MARK" \
-            -j "$UDP_CHAIN" 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 224.0.0.0/4 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 255.255.255.255/32 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -d 169.254.0.0/16 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -p udp --dport 53 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_CHAIN" -p udp \
-            -j TPROXY --on-port "$PORT" --tproxy-mark "$UDP_MARK/$UDP_MARK" 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 224.0.0.0/4 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 255.255.255.255/32 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -d 169.254.0.0/16 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -m owner --uid-owner 0 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -p udp --dport 53 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t mangle -C "$UDP_OUT_CHAIN" -p udp \
-            -j MARK --set-mark "$UDP_MARK/$UDP_MARK" 2>/dev/null \
-        && [ "$_udp6_ok" = "1" ]; then
+    if udp_tproxy_ready; then
+        ensure_udp6_protected || log "IPv6 UDP 保护安装失败，IPv4 继续"
         return 0
     fi
 
+    log "UDP iptables 规则不完整，尝试重建"
     if setup_udp_iptables; then
-        log "已重新添加 UDP iptables $UDP_CHAIN port=$PORT"
+        log "已重建 UDP iptables $UDP_CHAIN port=$PORT"
         return 0
     fi
-    install_udp_fail_closed || log "UDP fail-closed 安装失败"
+    if udp_v4_protected_ready; then
+        return 0
+    fi
+    log "UDP 兜底规则安装失败"
     return 1
 }
 
 tries=0
+udp_fail_tries=0
+udp_ever_ready=0
+udp_restart_tries=0
+ingress_tries=0
+ingress_restart_tries=0
+udp_ingress_fail_tries=0
 while true; do
-    sleep 30
+    if [ -f "$STOP_FLAG" ]; then
+        log "收到停止请求，退出 watchdog"
+        exit 0
+    fi
+    sleep 5
 
     PORT="$(read_port "$CONF")" || {
         log "监听地址无效: $CONF"
@@ -137,29 +163,56 @@ while true; do
         ensure_iptables || log "iptables 修复失败"
         if read_udp_enabled "$CONF"; then
             if udp_port_open "$PORT" "$PID"; then
-                ensure_udp_iptables || log "UDP iptables 修复失败"
-            else
-                # ingress 不属于本 daemon：拆 TPROXY、装 fail-closed，不自动重启。
-                remove_udp_partial
-                _fail_ready=1
-                iptables -w 5 -t filter -C OUTPUT -p udp -j "$UDP_FAIL_CHAIN" 2>/dev/null \
-                    && iptables -w 5 -t filter -C "$UDP_FAIL_CHAIN" -p udp -j DROP 2>/dev/null \
-                    || _fail_ready=0
-                iptables -w 5 -t filter -C FORWARD -p udp -j "$UDP_FAIL_FWD_CHAIN" 2>/dev/null \
-                    && iptables -w 5 -t filter -C "$UDP_FAIL_FWD_CHAIN" -p udp -j DROP 2>/dev/null \
-                    || _fail_ready=0
-                if command -v ip6tables >/dev/null 2>&1 \
-                    && ip6tables -w 5 -L OUTPUT >/dev/null 2>&1; then
-                    ip6tables -w 5 -t filter -C OUTPUT -p udp -j "$UDP6_FAIL_CHAIN" 2>/dev/null \
-                        && ip6tables -w 5 -t filter -C "$UDP6_FAIL_CHAIN" -p udp -j DROP 2>/dev/null \
-                        || _fail_ready=0
-                    ip6tables -w 5 -t filter -C FORWARD -p udp -j "$UDP6_FAIL_FWD_CHAIN" 2>/dev/null \
-                        && ip6tables -w 5 -t filter -C "$UDP6_FAIL_FWD_CHAIN" -p udp -j DROP 2>/dev/null \
-                        || _fail_ready=0
+                ingress_tries=0
+                ingress_restart_tries=0
+                udp_ingress_fail_tries=0
+                if ! udp_nfq_ready; then
+                    udp_fail_tries=$((udp_fail_tries + 1))
+                    ensure_udp_iptables "$PID" || log "UDP iptables 修复失败"
+                    if [ "$udp_fail_tries" -ge 3 ]; then
+                        if [ "$udp_ever_ready" -eq 0 ]; then
+                            log "NFQUEUE 从未就绪，保持兜底，不再重启 daemon"
+                        elif [ "$udp_restart_tries" -ge 3 ]; then
+                            log "NFQUEUE 多次重启失败，保持兜底，不再重启 daemon"
+                        else
+                            udp_restart_tries=$((udp_restart_tries + 1))
+                            log "NFQUEUE 未就绪，第 $udp_restart_tries 次重启 daemon"
+                            ROUTEPROXY_NO_WATCHDOG=1 "$SERVICE" start \
+                                >> "$DATA/logs/service.log" 2>&1 || log "重启 daemon 失败"
+                        fi
+                        udp_fail_tries=0
+                    fi
+                    tries=0
+                    continue
                 fi
-                if [ "$_fail_ready" = "0" ]; then
-                    log "UDP ingress 未监听，安装 fail-closed (port=$PORT)"
-                    install_udp_fail_closed || log "UDP fail-closed 安装失败"
+                udp_ever_ready=1
+                udp_restart_tries=0
+                udp_fail_tries=0
+                ensure_udp_iptables "$PID" || log "UDP iptables 修复失败"
+            else
+                udp_ingress_fail_tries=$((udp_ingress_fail_tries + 1))
+                if [ "$udp_ingress_fail_tries" -lt 2 ]; then
+                    log "UDP ingress 未监听，等待下一轮确认 (attempt=$udp_ingress_fail_tries)"
+                    tries=0
+                    continue
+                fi
+                # ingress 不属于本 daemon：先确保兜底，再拆 TPROXY，避免直连窗口。
+                if ! udp_v4_protected_ready; then
+                    log "UDP ingress 未监听，安装 UDP 兜底规则 (port=$PORT)"
+                    if ! install_udp_fail_closed_or_443; then
+                        log "UDP 兜底规则安装失败，保留现有规则"
+                        tries=0
+                        continue
+                    fi
+                fi
+                remove_udp_tproxy_only
+                ingress_tries=$((ingress_tries + 1))
+                if [ "$ingress_tries" -ge 3 ] && [ "$ingress_restart_tries" -lt 3 ]; then
+                    ingress_restart_tries=$((ingress_restart_tries + 1))
+                    log "UDP ingress 连续缺失，第 $ingress_restart_tries 次重启 daemon"
+                    ROUTEPROXY_NO_WATCHDOG=1 "$SERVICE" start \
+                        >> "$DATA/logs/service.log" 2>&1 || log "重启 daemon 失败"
+                    ingress_tries=0
                 fi
             fi
         fi
@@ -169,6 +222,12 @@ while true; do
 
     tries=$((tries + 1))
     log "daemon 不健康 (pid=${PID:-无}, port=$PORT, attempt=$tries)"
+    if read_udp_enabled "$CONF"; then
+        if ! udp_v4_protected_ready; then
+            install_udp_fail_closed_or_443 || log "UDP 兜底规则安装失败"
+        fi
+        udp_v4_protected_ready && remove_udp_tproxy_only
+    fi
     if [ "$tries" -ge 3 ]; then
         log "连续失败 3 次，退避 5 分钟"
         sleep 300
@@ -176,7 +235,6 @@ while true; do
         continue
     fi
 
-    # 只启动 daemon 和 iptables；本 watchdog 继续运行。
     if ROUTEPROXY_NO_WATCHDOG=1 "$SERVICE" start \
         >> "$DATA/logs/service.log" 2>&1; then
         log "重启成功"

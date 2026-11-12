@@ -54,7 +54,7 @@ keep = 3
 | --- | --- | --- | --- | --- |
 | `proxy` | `mode` | 是 | — | `http` 或 `transparent`。桌面平台（macOS/Linux/Windows）推荐 `http`，可直接配合系统/全局代理；`transparent` 仅用于 Android Magisk 模块，且必须只有一个 `127.0.0.1` 监听地址。 |
 | `proxy` | `listen` | 是 | — | 监听地址数组，必须是 loopback；端口不能为 0，不能重复。HTTP 模式可同时监听 IPv4/IPv6；`transparent` 只能一个 IPv4 loopback。 |
-| `proxy` | `upstream` | 是 | — | TCP 上游。支持 `http://host:port`（HTTP CONNECT）和 `socks5://host:port`（SOCKS5 CONNECT）；`http` 模式只允许 HTTP 上游，SOCKS5 用于 `transparent`。裸 `host:port` 按 HTTP 处理。端口不能为 0；不能是 unspecified/multicast/broadcast，也不能等于任一 `listen` 地址。 |
+| `proxy` | `upstream` | 是 | — | TCP 上游。必须带 `http://host:port`（HTTP CONNECT）或 `socks5://host:port`（SOCKS5 CONNECT）；`http` 模式只允许 HTTP 上游，SOCKS5 用于 `transparent`。端口不能为 0；不能是 unspecified/multicast/broadcast，也不能等于任一 `listen` 地址。 |
 | `proxy` | `udp_upstream` | 否 | — | UDP 上游，只接受 `socks5://host:port`；`udp.enabled = true` 时必填。UDP 不复用 HTTP CONNECT。 |
 | `proxy` | `max_connections` | 否 | `4096` | 同时活跃的 TCP 连接/请求上限；透明模式每个连接占客户端和上游两个 fd，需同时确认进程 `ulimit -n`。 |
 | `proxy` | `idle_timeout_secs` | 否 | `300` | 双向连接无数据多久后回收；用于回收半关闭或长期空闲的隧道，必须大于 0。 |
@@ -97,14 +97,14 @@ default = "proxy"
 reject_ports = [443]
 ```
 
-- 每个 UDP 五元组 flow 使用一个 SOCKS5 UDP association，并复用同一个客户端 UDP 源 socket；不能按数据报重建 association。flow 队列有 64 MiB 全局字节预算，flow 常驻缓冲另有 64 MiB 预算（每 flow 按两块 64 KiB 预留），预算耗尽时丢新数据报/新 flow，不拆已有 flow；单个源 `ip:port`（socket）最多 64 个 flow，全机上限由 512 flow/64 MiB 预算兜底，避免一个 app 占满全机 UDP。
-- UDP 只支持 IPv4；Android 脚本在 `ip6tables` 可用时用 `ROUTEPROXY_UDP6` 拒绝 IPv6 UDP，不回退直连；`ip6tables` 不可用时跳过 IPv6 规则，不阻塞 IPv4。
+- 每个 UDP 五元组 flow 使用一个 SOCKS5 UDP association，并复用同一个客户端 UDP 源 socket；不能按数据报重建 association。flow 队列有 64 MiB 全局字节预算，flow 常驻缓冲另有 64 MiB 预算（每 flow 按两块 64 KiB 预留），预算耗尽时丢新数据报/新 flow，不拆已有 flow；单个源 IP 最多 256 个 flow，全机上限由 512 flow/64 MiB 预算兜底，避免一个 app 占满全机 UDP。
+- UDP 只支持 IPv4；Android 脚本在 `ip6tables` 可用时用 `ROUTEPROXY_UDP4436` 只丢弃 IPv6 UDP 443（QUIC），其他 IPv6 UDP 直连；`ip6tables` 不可用时跳过 IPv6 规则，不阻塞 IPv4。
 - UDP 443（QUIC/HTTP/3）在公共 Geph exit 被硬编码禁止，无法靠 routeproxy 或配置绕过。默认 Android 示例把 443 放入 `reject_ports`，让浏览器回落 TCP；需要真实 QUIC 时必须换支持 UDP 443 的上游。
 - `routing.exclude_ports` 和防火墙都要在 TPROXY 前排除 DNS 53；否则 DNS 会被透明 UDP 截走。smartdns 仍是唯一解析器。
 - `udp.enabled = true` 时若未排除 53，启动会记录 warning；不会自动改写规则或防火墙。
-- `udp.reject_ports` 在数据面静默丢弃匹配 flow，不回 ICMP；安装失败时的 IPv4/IPv6 fail-closed 链都用 `DROP`，避免依赖 Android 上不保证存在的 `REJECT` target。IPv4 fail-closed 保证不回退直连；IPv6 仅在 `ip6tables` 可用时安装，失败会记录日志。
-- Android 的 `setup_udp_iptables` 使用独立 `ROUTEPROXY_UDP` mangle 链、高位 `mark 0x40000000`、模块专属 `ip rule table 21072` 和 `TPROXY`；不要和 TCP 的 `ROUTEPROXY_TP` nat 链混用。UDP 链安装失败时保留 TCP，并安装 `ROUTEPROXY_UDP_FAIL` / `ROUTEPROXY_UDP_FAIL_FWD` fail-closed，避免 UDP 退回直连。
-- 当前没有 IPv6 UDP ingress；启用 UDP 时脚本用 `ROUTEPROXY_UDP6` filter 链拒绝 IPv6 UDP（回环、link-local、multicast、root、UDP 53 除外），避免 IPv6 流量绕过 IPv4-only 的 TPROXY。UDP 规则安装失败时同样安装 `ROUTEPROXY_UDP6_FAIL` fail-closed。IPv6-only 网络或依赖 IPv6 UDP 的应用应关闭 `udp.enabled`。
+- `udp.reject_ports` 在数据面静默丢弃匹配 flow，不回 ICMP；IPv4 完整 fail-closed 安装失败时降级为 IPv4/IPv6 的 UDP 443 `DROP`，并放行 root 与回环。此时只挡 QUIC，其他 UDP 可能直连。
+- Android 的 `setup_udp_iptables` 对转发流量使用独立 `ROUTEPROXY_UDP` mangle 链、高位 `mark 0x40000000`、模块专属 `ip rule table 21072` 和 `TPROXY`；对本机 App 的 UDP 使用 `ROUTEPROXY_UDP_NFQ` mangle OUTPUT 链 `NFQUEUE --queue-num 21072`，daemon 从 nfnetlink 消息读取原始目标，并用 raw socket 以原目标源地址回包；raw socket 创建失败时只降级本机 UDP，TCP 和转发 UDP 继续。不要和 TCP 的 `ROUTEPROXY_TP` nat 链混用。本地地址 bypass 由 `ip addr` 生成，不依赖 `xt_addrtype`；mangle 和 filter 的父链都用 `RETURN` 回到调用链，避免子链 `ACCEPT` 跳过后续 VPN/netd 规则。地址变化后 watchdog 只刷新本地 bypass，不重建 TPROXY。UDP 链安装失败时保留 TCP，并安装 `ROUTEPROXY_UDP_FAIL` / `ROUTEPROXY_UDP_FAIL_FWD` fail-closed；完整 fail-closed 不可用时降级为 `ROUTEPROXY_UDP443` 链，只 DROP UDP 443，放行本机地址、root 和回环。
+- 当前没有 IPv6 UDP ingress；启用 UDP 时脚本用 `ROUTEPROXY_UDP4436` filter 链只丢弃 IPv6 UDP 443，其他 IPv6 UDP 直连；回环、link-local、multicast、root、UDP 53 仍豁免。`ip6tables` 不可用时跳过 IPv6 规则。IPv6-only 网络或依赖 IPv6 UDP 443 的应用应关闭 `udp.enabled`。
 
 ## 规则文件
 

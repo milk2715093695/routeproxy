@@ -9,9 +9,12 @@ WATCHDOG_SCRIPT="$MODDIR/scripts/watchdog.sh"
 CHAIN=ROUTEPROXY_TP
 PIDFILE="$DATA/routeproxy.pid"
 WATCHDOG_PID="$DATA/watchdog.pid"
+SERVICE_LOCK="$DATA/service.lock"
+STOP_FLAG="$DATA/stop.requested"
 LOG="$DATA/logs/service.log"
 
 unset LD_PRELOAD
+export ROUTEPROXY_NFQ_READY="$DATA/udp-nfq.ready"
 mkdir -p "$DATA/logs"
 # 放宽 fd 上限；失败时保留系统默认值，不阻止启动。
 if ! ulimit -n 65536 2>/dev/null; then
@@ -32,6 +35,50 @@ log() {
 
 read_pid() {
     [ -f "$1" ] && cat "$1" 2>/dev/null
+}
+
+acquire_lock() {
+    if mkdir "$SERVICE_LOCK" 2>/dev/null; then
+        echo $$ > "$SERVICE_LOCK/pid" || return 1
+        [ "$(cat "$SERVICE_LOCK/pid" 2>/dev/null)" = "$$" ] || return 1
+        return 0
+    fi
+    _lock_pid="$(cat "$SERVICE_LOCK/pid" 2>/dev/null)"
+    # 另一个进程可能刚 mkdir、尚未写 pid；先等它写完，避免误判陈旧锁。
+    _lock_wait=0
+    while [ -z "$_lock_pid" ] && [ "$_lock_wait" -lt 20 ]; do
+        sleep 0.1
+        _lock_pid="$(cat "$SERVICE_LOCK/pid" 2>/dev/null)"
+        _lock_wait=$((_lock_wait + 1))
+    done
+    _self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+    if [ -n "$_lock_pid" ] \
+        && { is_pid_for "$_lock_pid" "/system/bin/sh" "$_self" \
+            || is_pid_for "$_lock_pid" "/system/bin/sh" "$0"; }; then
+        log "已有 service 操作在运行 (pid=$_lock_pid)"
+        return 1
+    fi
+    # 先移走再删除，避免和另一个 service 的锁替换竞态。
+    _stale="$SERVICE_LOCK.stale.$$"
+    if mv "$SERVICE_LOCK" "$_stale" 2>/dev/null; then
+        _stale_pid="$(cat "$_stale/pid" 2>/dev/null)"
+        if [ -n "$_stale_pid" ] \
+            && { is_pid_for "$_stale_pid" "/system/bin/sh" "$_self" \
+                || is_pid_for "$_stale_pid" "/system/bin/sh" "$0"; }; then
+            # mv 期间另一个实例刚写好锁，放回去并放弃竞争。
+            mv "$_stale" "$SERVICE_LOCK" 2>/dev/null || rm -rf "$_stale"
+            log "service 锁已被新实例持有 (pid=$_stale_pid)"
+            return 1
+        fi
+        rm -rf "$_stale"
+    fi
+    mkdir "$SERVICE_LOCK" 2>/dev/null || return 1
+    echo $$ > "$SERVICE_LOCK/pid" || return 1
+    [ "$(cat "$SERVICE_LOCK/pid" 2>/dev/null)" = "$$" ] || return 1
+}
+
+release_lock() {
+    [ "$(cat "$SERVICE_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$SERVICE_LOCK"
 }
 
 is_routeproxy_pid() {
@@ -71,18 +118,32 @@ stop_proxy() {
     stop_pid "$PIDFILE" "$BIN" run "$CONF"
 }
 
-# 启动失败时保留 UDP fail-closed；仅 UDP 未启用才彻底拆除规则。
+# 启动失败时无条件撤 TCP；UDP 保留兜底，只有无兜底才拆 TPROXY。
 cleanup_start_failure() {
-    stop_proxy
+    remove_tcp_iptables || log "清理 TCP 规则失败"
     if [ "${udp_enabled:-0}" = "1" ]; then
-        remove_iptables_keep_udp_fail_closed
-        # setup_udp_iptables 可能已移除 fail-closed，这里重新装回。
-        if ! install_udp_fail_closed; then
-            log "启动失败后 UDP fail-closed 安装失败，请检查 iptables"
+        if ! udp_v4_protected_ready; then
+            if ! install_udp_fail_closed_or_443; then
+                # 没有兜底时不能留下指向已停 daemon 的 TPROXY，否则 UDP 会静默黑洞。
+                log "启动失败后 UDP 兜底规则安装失败，拆除 TPROXY 后停止"
+                remove_udp_tproxy_only || log "拆除 UDP TPROXY 失败"
+                stop_proxy
+                rm -f "$ROUTEPROXY_NFQ_READY"
+                return 1
+            fi
+        fi
+        if udp_v4_protected_ready; then
+            remove_iptables_keep_udp_fail_closed
+            # setup_udp_iptables 可能已移除 fail-closed，这里只补缺失的兜底。
+            refresh_udp_local_bypass || log "刷新 UDP 本地地址 bypass 失败"
+        else
+            remove_udp_iptables
         fi
     else
         remove_iptables
     fi
+    stop_proxy
+    rm -f "$ROUTEPROXY_NFQ_READY"
 }
 
 start_service() {
@@ -103,18 +164,27 @@ start_service() {
     read_udp_enabled "$CONF" && udp_enabled=1
 
     stop_watchdog
-    stop_proxy
     if [ "$udp_enabled" = "1" ]; then
-        # 先装 fail-closed 再拆旧 TPROXY，避免重启窗口内 UDP 直连。
-        if ! install_udp_fail_closed; then
-            log "UDP fail-closed 安装失败，拒绝启动以免 UDP 直连"
-            return 1
+        # 先装 UDP 兜底再拆旧 TPROXY；完整 fail-closed 不可用时只挡 443。
+        refresh_udp_local_bypass || log "刷新 UDP 本地地址 bypass 失败"
+        if ! udp_v4_protected_ready; then
+            if ! install_udp_fail_closed_or_443; then
+                log "UDP 兜底规则安装失败，拒绝启动"
+                cleanup_start_failure
+                return 1
+            fi
         fi
+        if ! udp_v4_fail_closed_ready; then
+            log "IPv4 完整 fail-closed 不可用，当前仅挡 UDP 443"
+        fi
+        stop_proxy
         remove_iptables_keep_udp_fail_closed
     else
         remove_iptables
+        stop_proxy
     fi
 
+    rm -f "$ROUTEPROXY_NFQ_READY"
     setsid sh -c 'echo $$ > "$1"; exec "$2" run --config "$3"' sh \
         "$PIDFILE" "$BIN" "$CONF" >> "$DATA/logs/stdout.log" 2>&1 &
     # pidfile 由子 shell 写入；不要用固定 1 秒赌它已经落盘。
@@ -138,19 +208,33 @@ start_service() {
     fi
 
     if [ "$udp_enabled" = "1" ]; then
-        if ! wait_udp_port "$PORT" "$pid"; then
+        _wait=0
+        while [ "$_wait" -lt 150 ] && ! udp_nfq_ready; do
+            sleep 0.1
+            _wait=$((_wait + 1))
+        done
+        if ! udp_nfq_ready; then
+            log "NFQUEUE 未就绪，保留/安装 UDP 兜底规则；TCP 继续"
+            if ! udp_v4_protected_ready; then
+                install_udp_fail_closed_or_443 || log "UDP 兜底规则也失败，请检查 iptables"
+            fi
+        elif ! wait_udp_port "$PORT" "$pid"; then
             # TCP 已建立；UDP 独立失败不拆 TCP，但不能 TPROXY 到无 listener 的端口。
-            log "UDP ingress 未监听，安装 UDP fail-closed；TCP 继续"
-            if ! install_udp_fail_closed; then
-                log "UDP fail-closed 也失败，请检查 iptables"
+            log "UDP ingress 未监听，保留/安装 UDP 兜底规则；TCP 继续"
+            if ! udp_v4_protected_ready; then
+                install_udp_fail_closed_or_443 || log "UDP 兜底规则也失败，请检查 iptables"
             fi
         elif ! setup_udp_iptables; then
-            log "UDP iptables 设置失败，安装 UDP fail-closed；TCP 继续"
-            if ! install_udp_fail_closed; then
-                log "UDP fail-closed 也失败，请检查 iptables"
+            log "UDP iptables 设置失败，保留/安装 UDP 兜底规则；TCP 继续"
+            if ! udp_v4_protected_ready; then
+                install_udp_fail_closed_or_443 || log "UDP 兜底规则也失败，请检查 iptables"
             fi
         else
-            log "UDP 透明链已启用 port=$PORT"
+            if [ "${_udp_forward_ok:-1}" = "0" ]; then
+                log "UDP 本机 NFQUEUE 已启用；转发规则未安装（ip rule priority 冲突）"
+            else
+                log "UDP 透明链已启用 port=$PORT"
+            fi
         fi
     fi
 
@@ -179,13 +263,34 @@ stop_service() {
     stop_watchdog
     remove_iptables
     stop_proxy
+    rm -f "$ROUTEPROXY_NFQ_READY" "$STOP_FLAG"
     log "已停止"
 }
 
 case "$1" in
-    start) start_service ;;
-    stop) stop_service ;;
-    "") start_service ;;
+    start)
+        rm -f "$STOP_FLAG"
+        acquire_lock || exit 1
+        start_service
+        rc=$?
+        release_lock
+        exit "$rc"
+        ;;
+    stop)
+        mkdir -p "$DATA"
+        acquire_lock || exit 1
+        : > "$STOP_FLAG"
+        stop_service
+        release_lock
+        ;;
+    "")
+        rm -f "$STOP_FLAG"
+        acquire_lock || exit 1
+        start_service
+        rc=$?
+        release_lock
+        exit "$rc"
+        ;;
     *)
         echo "用法: $0 [start|stop]" >&2
         exit 2

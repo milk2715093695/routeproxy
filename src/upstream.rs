@@ -19,8 +19,7 @@ impl TcpUpstream {
             Some((scheme, _)) => {
                 bail!("不支持的 TCP 上游协议: {scheme}，只允许 http:// 或 socks5://")
             }
-            // 兼容 0.1.x：裸地址按 HTTP 上游处理。
-            None => ("http", value),
+            None => bail!("TCP 上游必须带 http:// 或 socks5://: {value}"),
         };
         let address = canonicalize_addr(
             address
@@ -63,11 +62,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_bare_http_and_schemes() {
-        assert!(matches!(
-            TcpUpstream::parse("127.0.0.1:8080").unwrap(),
-            TcpUpstream::Http(_)
-        ));
+    fn accepts_http_and_socks5_schemes() {
         assert!(matches!(
             TcpUpstream::parse("http://127.0.0.1:8080").unwrap(),
             TcpUpstream::Http(_)
@@ -81,6 +76,7 @@ mod tests {
     #[test]
     fn rejects_unknown_scheme_and_bad_port() {
         assert!(TcpUpstream::parse("https://127.0.0.1:443").is_err());
+        assert!(TcpUpstream::parse("127.0.0.1:8080").is_err());
         assert!(TcpUpstream::parse("127.0.0.1:0").is_err());
         assert!(TcpUpstream::parse("127.0.0.1:8080/path").is_err());
     }

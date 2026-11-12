@@ -14,7 +14,10 @@ use crate::config::Config;
 use crate::engine::Engine;
 
 mod flow;
+mod nfqueue;
+mod raw;
 use flow::{queue_datagram, run_flow, FlowKey, FlowRegistry, FlowTask};
+use raw::{RawReply, SharedRawReply};
 
 // 每 flow 最多缓冲 8 个数据报；满则丢当前数据报，不拆已有 flow。
 const FLOW_QUEUE: usize = 8;
@@ -22,16 +25,19 @@ const FLOW_BUFFER_BUDGET: usize = 64 * 1024 * 1024;
 // 每 flow 预留两块 64 KiB：接收缓冲和 SOCKS5 包缓冲；direct flow 只占一块。
 const FLOW_MEMORY_PER_FLOW: usize = 2 * BUFFER_SIZE;
 const FLOW_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
-// 内存预算先于 1024 防御上限生效，实际最多 512 flow。
 const MAX_FLOWS: usize = FLOW_MEMORY_BUDGET / FLOW_MEMORY_PER_FLOW;
-// 单个源 socket 最多 64 flow；一个 app 可用多个 socket 绕过，全机仍受内存预算限制。
-const MAX_FLOWS_PER_CLIENT: usize = 64;
+// 同一源 IP 最多 256 flow；本机所有 app 共享一个 IP，阈值不能按单 app 估。
+const MAX_FLOWS_PER_CLIENT: usize = 256;
+const MAX_FLOWS_PER_SOCKET: usize = 64;
 // 上游失败后 5 秒内不再重建同一 flow。
 const FLOW_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 pub(super) const BUFFER_SIZE: usize = 65_535;
+// 必须与 packaging/android/scripts/common.sh 的 UDP_NFQ_QUEUE 保持一致。
+const NFQUEUE_NUM: u16 = 21072;
 pub(super) type ReplyRegistry = Arc<Mutex<HashMap<SocketAddrV4, Weak<TokioUdpSocket>>>>;
 pub(super) type FlowFailures = Arc<Mutex<HashMap<FlowKey, Instant>>>;
 
+#[derive(Clone)]
 struct UdpState {
     config: Arc<Config>,
     engine: Arc<Engine>,
@@ -42,6 +48,7 @@ struct UdpState {
     flow_budget: Arc<Semaphore>,
     handle: tokio::runtime::Handle,
     listen_port: u16,
+    raw_reply: Option<SharedRawReply>,
 }
 
 pub async fn serve(config: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
@@ -50,8 +57,20 @@ pub async fn serve(config: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
         .first()
         .context("transparent 配置缺少监听地址")?
         .port();
-    let socket =
-        bind_ingress(port).with_context(|| format!("绑定 UDP TPROXY 入口 0.0.0.0:{port} 失败"))?;
+    let socket = Arc::new(
+        bind_ingress(port).with_context(|| format!("绑定 UDP TPROXY 入口 0.0.0.0:{port} 失败"))?,
+    );
+    let raw_reply = match RawReply::new() {
+        Ok(raw) => Some(Arc::new(raw)),
+        Err(error) => {
+            tracing::warn!(
+                event = "udp_nfqueue",
+                error = %error,
+                "创建 UDP 本机回包 raw socket 失败，本机 UDP 将降级"
+            );
+            None
+        }
+    };
     let state = UdpState {
         config,
         engine,
@@ -62,7 +81,20 @@ pub async fn serve(config: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
         flow_budget: Arc::new(Semaphore::new(FLOW_MEMORY_BUDGET)),
         handle: tokio::runtime::Handle::current(),
         listen_port: port,
+        raw_reply,
     };
+    if state.raw_reply.is_some() {
+        let nfqueue_state = state.clone();
+        std::thread::Builder::new()
+            .name("routeproxy-udp-nfqueue".to_owned())
+            .spawn(move || nfqueue::run(NFQUEUE_NUM, nfqueue_state))
+            .context("启动 UDP NFQUEUE 线程失败")?;
+    } else {
+        tracing::warn!(
+            event = "udp_nfqueue",
+            "raw socket 不可用，本机 UDP 不启用 NFQUEUE，转发继续"
+        );
+    }
     let thread = std::thread::Builder::new()
         .name("routeproxy-udp-ingress".to_owned())
         .spawn(move || ingress_loop(socket, state))
@@ -78,7 +110,7 @@ pub async fn serve(config: Arc<Config>, engine: Arc<Engine>) -> Result<()> {
     }
 }
 
-fn ingress_loop(socket: UdpSocket, state: UdpState) {
+fn ingress_loop(socket: Arc<UdpSocket>, state: UdpState) {
     let mut buffer = vec![0_u8; BUFFER_SIZE];
     loop {
         let (client, target, length) = match recv_original(&socket, &mut buffer) {
@@ -95,11 +127,11 @@ fn ingress_loop(socket: UdpSocket, state: UdpState) {
                 continue;
             }
         };
-        dispatch((client, target), &buffer[..length], &state);
+        dispatch((client, target), false, &buffer[..length], &state);
     }
 }
 
-fn dispatch(key: FlowKey, payload: &[u8], state: &UdpState) {
+fn dispatch(key: FlowKey, local: bool, payload: &[u8], state: &UdpState) {
     let (client, target) = key;
     let config = &state.config;
     let engine = &state.engine;
@@ -229,6 +261,21 @@ fn dispatch(key: FlowKey, payload: &[u8], state: &UdpState) {
         );
         return;
     }
+    let socket_flows = flows
+        .keys()
+        .filter(|(existing_client, _)| *existing_client == client)
+        .count();
+    if socket_flows >= MAX_FLOWS_PER_SOCKET {
+        tracing::debug!(
+            event = "udp_socket_flow_limit",
+            transport = "udp",
+            client = %client,
+            target = %target,
+            limit = MAX_FLOWS_PER_SOCKET,
+            "单个源端口 UDP flow 数量达到上限，丢弃数据报"
+        );
+        return;
+    }
 
     let Ok(flow_permit) =
         Arc::clone(flow_budget).try_acquire_many_owned(FLOW_MEMORY_PER_FLOW as u32)
@@ -268,6 +315,7 @@ fn dispatch(key: FlowKey, payload: &[u8], state: &UdpState) {
     let registry = Arc::clone(registry);
     let failures = Arc::clone(failures);
     let replies = Arc::clone(replies);
+    let raw_reply = state.raw_reply.clone();
     handle.spawn(async move {
         run_flow(FlowTask {
             key,
@@ -277,6 +325,8 @@ fn dispatch(key: FlowKey, payload: &[u8], state: &UdpState) {
             registry,
             failures,
             replies,
+            local,
+            raw_reply,
             sender,
             permit: flow_permit,
         })

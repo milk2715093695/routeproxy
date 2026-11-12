@@ -45,7 +45,7 @@ pub enum Mode {
 pub struct ProxyConfig {
     pub mode: Mode,
     pub listen: Vec<String>,
-    /// TCP 上游；裸 host:port 兼容 0.1.x，按 HTTP 处理。
+    /// TCP 上游；必须带 http:// 或 socks5://。
     pub upstream: String,
     /// UDP 上游；只接受 socks5://。
     #[serde(default)]
@@ -334,13 +334,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_upstream_loads_as_http() {
-        let config = load(&base(
+    fn upstream_requires_scheme() {
+        let result = load(&base(
             "[proxy]\nmode = \"http\"\nlisten = [\"127.0.0.1:6045\"]\nupstream = \"127.0.0.1:9910\"",
-        ))
-        .unwrap();
-        assert_eq!(config.tcp_upstream().scheme(), "http");
-        assert!(!config.udp_enabled());
+        ));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -392,19 +390,19 @@ mod tests {
     #[test]
     fn connection_limits_have_safe_defaults() {
         let config = load(&base(
-            "[proxy]\nmode = \"http\"\nlisten = [\"127.0.0.1:6045\"]\nupstream = \"127.0.0.1:9910\"",
+            "[proxy]\nmode = \"http\"\nlisten = [\"127.0.0.1:6045\"]\nupstream = \"http://127.0.0.1:9910\"",
         ))
         .unwrap();
         assert_eq!(config.max_connections(), 4096);
         assert_eq!(config.idle_timeout(), Duration::from_secs(300));
 
         let text = base(
-            "[proxy]\nmode = \"http\"\nlisten = [\"127.0.0.1:6045\"]\nupstream = \"127.0.0.1:9910\"\nmax_connections = 0",
+            "[proxy]\nmode = \"http\"\nlisten = [\"127.0.0.1:6045\"]\nupstream = \"http://127.0.0.1:9910\"\nmax_connections = 0",
         );
         assert!(load(&text).is_err());
 
         let text = base(
-            "[proxy]\nmode = \"http\"\nlisten = [\"127.0.0.1:6045\"]\nupstream = \"127.0.0.1:9910\"\nidle_timeout_secs = 0",
+            "[proxy]\nmode = \"http\"\nlisten = [\"127.0.0.1:6045\"]\nupstream = \"http://127.0.0.1:9910\"\nidle_timeout_secs = 0",
         );
         assert!(load(&text).is_err());
     }

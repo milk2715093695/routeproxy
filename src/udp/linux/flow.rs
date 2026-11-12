@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
@@ -13,6 +14,7 @@ use crate::config::{Config, UdpDefault};
 use crate::engine::{Decision, Engine};
 use crate::socks5::UdpAssociation;
 
+use super::raw::SharedRawReply;
 use super::{reply_for, FlowFailures, ReplyRegistry, BUFFER_SIZE};
 
 const FLOW_IDLE: Duration = Duration::from_secs(30);
@@ -33,6 +35,8 @@ pub(super) struct FlowTask {
     pub(super) registry: FlowRegistry,
     pub(super) failures: FlowFailures,
     pub(super) replies: ReplyRegistry,
+    pub(super) local: bool,
+    pub(super) raw_reply: Option<SharedRawReply>,
     pub(super) sender: mpsc::Sender<QueuedDatagram>,
     pub(super) permit: OwnedSemaphorePermit,
 }
@@ -51,6 +55,25 @@ impl fmt::Display for UdpDecision {
             Self::Proxy => "proxy",
             Self::Reject => "reject",
         })
+    }
+}
+
+pub(super) enum ReplySocket {
+    Target(Arc<TokioUdpSocket>),
+    Raw(SharedRawReply),
+}
+
+impl ReplySocket {
+    async fn send_to(
+        &self,
+        buffer: &[u8],
+        client: SocketAddrV4,
+        target: SocketAddrV4,
+    ) -> io::Result<usize> {
+        match self {
+            Self::Target(socket) => socket.send_to(buffer, client).await,
+            Self::Raw(socket) => socket.send_to(buffer, target, client),
+        }
     }
 }
 pub(super) fn queue_datagram(budget: &Arc<Semaphore>, payload: &[u8]) -> Option<QueuedDatagram> {
@@ -72,6 +95,8 @@ pub(super) async fn run_flow(task: FlowTask) {
         registry,
         failures,
         replies,
+        local,
+        raw_reply,
         sender,
         permit: _flow_permit,
     } = task;
@@ -79,7 +104,7 @@ pub(super) async fn run_flow(task: FlowTask) {
     let flow_id = crate::logging::next_flow_id();
     let decision = decide(&config, &engine, target).await;
     if decision == UdpDecision::Reject {
-        tracing::info!(
+        tracing::debug!(
             event = "udp_flow",
             flow_id,
             transport = "udp",
@@ -88,27 +113,47 @@ pub(super) async fn run_flow(task: FlowTask) {
             decision = %decision,
             "UDP flow 被拒绝"
         );
-        finish_flow(&registry, key, &sender);
+        if finish_flow(&registry, key, &sender) {
+            mark_flow_failure(&failures, key);
+        }
         return;
     }
 
-    let reply = match reply_for(&replies, target) {
-        Ok(socket) => socket,
-        Err(error) => {
+    let reply = if local {
+        let Some(raw_reply) = raw_reply else {
             tracing::warn!(
                 event = "udp_flow",
                 flow_id,
                 transport = "udp",
                 client = %client,
                 target = %target,
-                decision = %decision,
-                error = %error,
-                "UDP 回包 socket 注册失败"
+                "本机 UDP 缺少 raw 回包 socket，关闭 flow"
             );
             if finish_flow(&registry, key, &sender) {
                 mark_flow_failure(&failures, key);
             }
             return;
+        };
+        ReplySocket::Raw(raw_reply)
+    } else {
+        match reply_for(&replies, target) {
+            Ok(socket) => ReplySocket::Target(socket),
+            Err(error) => {
+                tracing::warn!(
+                    event = "udp_flow",
+                    flow_id,
+                    transport = "udp",
+                    client = %client,
+                    target = %target,
+                    decision = %decision,
+                    error = %error,
+                    "UDP 回包 socket 注册失败"
+                );
+                if finish_flow(&registry, key, &sender) {
+                    mark_flow_failure(&failures, key);
+                }
+                return;
+            }
         }
     };
 
@@ -159,7 +204,7 @@ async fn run_direct(
     receiver: &mut mpsc::Receiver<QueuedDatagram>,
     target: SocketAddrV4,
     client: SocketAddrV4,
-    reply: Arc<TokioUdpSocket>,
+    reply: ReplySocket,
 ) -> Result<()> {
     let upstream = TokioUdpSocket::bind("0.0.0.0:0")
         .await
@@ -185,7 +230,7 @@ async fn run_direct(
                     );
                     continue;
                 }
-                reply.send_to(&buffer[..length], client).await.context("UDP 回包发送失败")?;
+                reply.send_to(&buffer[..length], client, target).await.context("UDP 回包发送失败")?;
                 idle.as_mut().reset(Instant::now() + FLOW_IDLE);
             }
             _ = &mut idle => return Ok(()),
@@ -198,7 +243,7 @@ async fn run_proxy(
     config: &Config,
     target: SocketAddrV4,
     client: SocketAddrV4,
-    reply: Arc<TokioUdpSocket>,
+    reply: ReplySocket,
 ) -> Result<()> {
     let proxy = config
         .udp_upstream_addr()
@@ -226,7 +271,7 @@ async fn run_proxy(
                     );
                     continue;
                 }
-                reply.send_to(&buffer[..length], client).await.context("UDP 回包发送失败")?;
+                reply.send_to(&buffer[..length], client, target).await.context("UDP 回包发送失败")?;
                 idle.as_mut().reset(Instant::now() + FLOW_IDLE);
             }
             _ = closed.notified() => {

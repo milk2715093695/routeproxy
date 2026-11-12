@@ -1,6 +1,6 @@
 id=routeproxy-tp
 name=routeproxy 透明代理
-version=v0.2.0
-versionCode=200
+version=v0.2.1
+versionCode=201
 author=milk
 description=HTTP/透明 TCP/UDP 路由代理；支持 Android 透明 IPv4 与 SOCKS5 UDP。
