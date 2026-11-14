@@ -8,8 +8,8 @@ const HELP_TEMPLATE: &str = "{about-with-newline}\n用法: {usage}\n\n{all-args}
 #[command(
     name = "routeproxy",
     version,
-    about = "TCP 转发代理",
-    long_about = "routeproxy 是一个只处理 TCP 的转发代理：按规则选择直连或上游代理，支持 HTTP 代理与 Android 透明代理。",
+    about = "TCP/UDP 转发代理",
+    long_about = "routeproxy 是一个 TCP/UDP 转发代理：按规则选择直连或上游代理，支持 HTTP 代理、Android 透明 TCP 与透明 UDP。",
     disable_help_flag = true,
     disable_version_flag = true,
     disable_help_subcommand = true,

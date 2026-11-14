@@ -328,9 +328,15 @@ fn bind_queue_inner(socket: &OwnedFd, queue: u16) -> io::Result<()> {
                 break;
             }
             if header.nlmsg_type == libc::NLMSG_ERROR as u16 {
+                let error_offset = offset + size_of::<libc::nlmsghdr>();
+                if message_len < size_of::<libc::nlmsghdr>() + size_of::<libc::nlmsgerr>() {
+                    tracing::warn!(event = "udp_nfqueue", queue, "NFQUEUE ACK 长度不足，跳过");
+                    offset += align(message_len);
+                    continue;
+                }
                 let error = unsafe {
                     std::ptr::read_unaligned(
-                        response[offset + size_of::<libc::nlmsghdr>()..]
+                        response[error_offset..offset + message_len]
                             .as_ptr()
                             .cast::<libc::nlmsgerr>(),
                     )

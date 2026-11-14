@@ -1,13 +1,16 @@
 # routeproxy
 
-`routeproxy` 是一个 HTTP/透明 TCP/UDP 转发代理，根据规则自动决定直连还是使用上游代理。透明 UDP 支持 Linux/Android 的 IPv4 ingress，当前只在 Android 验收。
+`routeproxy` 是一个 HTTP/透明 TCP/UDP 转发代理，根据规则自动决定直连还是使用上游代理。透明 TCP 当前只覆盖 Android 本机 IPv4 App；透明 UDP 支持 Linux/Android 的 IPv4 ingress。
 
 ## 目录
 
 - [routeproxy](#routeproxy)
   - [目录](#目录)
   - [构建](#构建)
+    - [发布检查](#发布检查)
   - [配置说明](#配置说明)
+    - [透明 TCP（Android）](#透明-tcpandroid)
+    - [透明 UDP（Android）](#透明-udpandroid)
   - [规则文件](#规则文件)
   - [运行](#运行)
   - [来源与许可](#来源与许可)
@@ -24,6 +27,13 @@ cargo build --release
 ```
 
 Android 交叉编译、macOS/Termux/Windows 打包脚本在 `packaging/` 下。
+
+### 发布检查
+
+- `VERSION`、`Cargo.toml`、`Cargo.lock`、`packaging/android/module.prop` 版本一致。
+- `cargo fmt --check`、`cargo test`、`cargo clippy --all-targets -- -D warnings` 和 Android 脚本 `sh -n` 通过。
+- 重新生成或替换 `rules.toml` seed；确认 `updated_at` 未过期。
+- 构建各平台包，核对 `SHA256SUMS`。
 
 ## 配置说明
 
@@ -77,6 +87,11 @@ keep = 3
 - HTTP 模式默认在 `max_connections`（4096）之外保留 1024 个 keep-alive 连接槽，活跃请求/隧道上限同样是 4096；响应头返回后释放活跃请求许可，慢速下载只占连接槽。透明模式每个连接占客户端和上游两个 fd，需同步放宽进程 `ulimit -n`。`100.64.0.0/10`（CGNAT/Tailscale）按私有地址直连。
 - 域名规则是后缀匹配；只写 `com` 会匹配所有 `.com` 域名，这是预期语义，`rules check` 不会把它当错误。
 
+### 透明 TCP（Android）
+
+- 透明 TCP 只覆盖 Android 本机 App 的 IPv4 出站连接（`nat OUTPUT`）；IPv6 TCP 不拦截，按普通直连处理；热点/转发的 TCP 也不经过 `OUTPUT`，不会被透明代理。
+- 启动时先确保 TCP 重定向规则就绪，再停旧进程；新进程启动失败时规则保留，流量继续指向未监听端口（fail-closed），不会静默回退直连。只有显式 `stop` 才撤规则。
+
 ### 透明 UDP（Android）
 
 透明 UDP 与 TCP 分开配置上游；UDP 不能走 HTTP 端口。示例：
@@ -98,11 +113,12 @@ reject_ports = [443]
 ```
 
 - 每个 UDP 五元组 flow 使用一个 SOCKS5 UDP association，并复用同一个客户端 UDP 源 socket；不能按数据报重建 association。flow 队列有 64 MiB 全局字节预算，flow 常驻缓冲另有 64 MiB 预算（每 flow 按两块 64 KiB 预留），预算耗尽时丢新数据报/新 flow，不拆已有 flow；单个源 IP 最多 256 个 flow，全机上限由 512 flow/64 MiB 预算兜底，避免一个 app 占满全机 UDP。
+- UDP 分片不重组；非首片没有 UDP 头，带 MF 的首片也没有完整数据报，NFQUEUE 会一律丢弃。依赖 IP 分片的 UDP 应用应避免，或改用 TCP。
 - UDP 只支持 IPv4；Android 脚本在 `ip6tables` 可用时用 `ROUTEPROXY_UDP4436` 只丢弃 IPv6 UDP 443（QUIC），其他 IPv6 UDP 直连；`ip6tables` 不可用时跳过 IPv6 规则，不阻塞 IPv4。
 - UDP 443（QUIC/HTTP/3）在公共 Geph exit 被硬编码禁止，无法靠 routeproxy 或配置绕过。默认 Android 示例把 443 放入 `reject_ports`，让浏览器回落 TCP；需要真实 QUIC 时必须换支持 UDP 443 的上游。
 - `routing.exclude_ports` 和防火墙都要在 TPROXY 前排除 DNS 53；否则 DNS 会被透明 UDP 截走。smartdns 仍是唯一解析器。
 - `udp.enabled = true` 时若未排除 53，启动会记录 warning；不会自动改写规则或防火墙。
-- `udp.reject_ports` 在数据面静默丢弃匹配 flow，不回 ICMP；IPv4 完整 fail-closed 安装失败时降级为 IPv4/IPv6 的 UDP 443 `DROP`，并放行 root 与回环。此时只挡 QUIC，其他 UDP 可能直连。
+- `udp.reject_ports` 在数据面静默丢弃匹配 flow，不回 ICMP；IPv4 完整 fail-closed 安装失败时降级为 IPv4/IPv6 的 UDP 443 `DROP`，并放行 root 与回环。service/watchdog 会记录 `仅挡 443` 的降级状态；此时只挡 QUIC，其他 UDP 可能直连。
 - Android 的 `setup_udp_iptables` 对转发流量使用独立 `ROUTEPROXY_UDP` mangle 链、高位 `mark 0x40000000`、模块专属 `ip rule table 21072` 和 `TPROXY`；对本机 App 的 UDP 使用 `ROUTEPROXY_UDP_NFQ` mangle OUTPUT 链 `NFQUEUE --queue-num 21072`，daemon 从 nfnetlink 消息读取原始目标，并用 raw socket 以原目标源地址回包；raw socket 创建失败时只降级本机 UDP，TCP 和转发 UDP 继续。不要和 TCP 的 `ROUTEPROXY_TP` nat 链混用。本地地址 bypass 由 `ip addr` 生成，不依赖 `xt_addrtype`；mangle 和 filter 的父链都用 `RETURN` 回到调用链，避免子链 `ACCEPT` 跳过后续 VPN/netd 规则。地址变化后 watchdog 只刷新本地 bypass，不重建 TPROXY。UDP 链安装失败时保留 TCP，并安装 `ROUTEPROXY_UDP_FAIL` / `ROUTEPROXY_UDP_FAIL_FWD` fail-closed；完整 fail-closed 不可用时降级为 `ROUTEPROXY_UDP443` 链，只 DROP UDP 443，放行本机地址、root 和回环。
 - 当前没有 IPv6 UDP ingress；启用 UDP 时脚本用 `ROUTEPROXY_UDP4436` filter 链只丢弃 IPv6 UDP 443，其他 IPv6 UDP 直连；回环、link-local、multicast、root、UDP 53 仍豁免。`ip6tables` 不可用时跳过 IPv6 规则。IPv6-only 网络或依赖 IPv6 UDP 443 的应用应关闭 `udp.enabled`。
 
@@ -110,7 +126,7 @@ reject_ports = [443]
 
 `rules.file` 指向一份最终 `rules.toml`，运行时只读取该快照。`routeproxy` 不生产专属规则，也不下载上游规则；它提供无策略的通用 `rules build`/`rules check`，数量下限、哨兵、路径和部署由部署方负责。
 
-仓库根目录的 `rules.toml` 是一份非个人通用 seed，发布包会把它作为 `rules.seed.toml` 或 `rules.toml` 附带。部署方可以复制并替换成自己的最终快照：
+仓库根目录的 `rules.toml` 是一份非个人通用 seed，发布包会把它作为 `rules.seed.toml` 或 `rules.toml` 附带。seed 的 `updated_at` 超过 14 天时 `doctor` 会提示过期；发布前应重新生成或替换快照，不要只改时间戳。部署方可以复制并替换成自己的最终快照：
 
 ```bash
 cp rules.toml /path/to/routeproxy/rules.toml

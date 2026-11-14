@@ -118,12 +118,13 @@ stop_proxy() {
     stop_pid "$PIDFILE" "$BIN" run "$CONF"
 }
 
-# 启动失败时无条件撤 TCP；UDP 保留兜底，只有无兜底才拆 TPROXY。
+# 启动失败保留 TCP fail-closed；UDP 保留兜底，无兜底才拆 TPROXY。
 cleanup_start_failure() {
-    remove_tcp_iptables || log "清理 TCP 规则失败"
     if [ "${udp_enabled:-0}" = "1" ]; then
         if ! udp_v4_protected_ready; then
-            if ! install_udp_fail_closed_or_443; then
+            install_udp_fail_closed_or_443
+            _udp_rc=$?
+            if [ "$_udp_rc" -eq 1 ]; then
                 # 没有兜底时不能留下指向已停 daemon 的 TPROXY，否则 UDP 会静默黑洞。
                 log "启动失败后 UDP 兜底规则安装失败，拆除 TPROXY 后停止"
                 remove_udp_tproxy_only || log "拆除 UDP TPROXY 失败"
@@ -133,14 +134,14 @@ cleanup_start_failure() {
             fi
         fi
         if udp_v4_protected_ready; then
-            remove_iptables_keep_udp_fail_closed
+            remove_udp_tproxy_only || log "拆除 UDP TPROXY 失败"
             # setup_udp_iptables 可能已移除 fail-closed，这里只补缺失的兜底。
             refresh_udp_local_bypass || log "刷新 UDP 本地地址 bypass 失败"
         else
             remove_udp_iptables
         fi
     else
-        remove_iptables
+        remove_udp_iptables
     fi
     stop_proxy
     rm -f "$ROUTEPROXY_NFQ_READY"
@@ -163,26 +164,36 @@ start_service() {
     udp_enabled=0
     read_udp_enabled "$CONF" && udp_enabled=1
 
+    # 规则已就绪时不要重建；正常重启不会出现 TCP 直连窗口。
+    if ! tcp_iptables_ready; then
+        if ! setup_iptables; then
+            log "TCP iptables 设置失败，保留现有规则和进程"
+            return 1
+        fi
+    fi
+
     stop_watchdog
+
     if [ "$udp_enabled" = "1" ]; then
         # 先装 UDP 兜底再拆旧 TPROXY；完整 fail-closed 不可用时只挡 443。
         refresh_udp_local_bypass || log "刷新 UDP 本地地址 bypass 失败"
         if ! udp_v4_protected_ready; then
-            if ! install_udp_fail_closed_or_443; then
+            install_udp_fail_closed_or_443
+            _udp_rc=$?
+            if [ "$_udp_rc" -eq 1 ]; then
                 log "UDP 兜底规则安装失败，拒绝启动"
                 cleanup_start_failure
                 return 1
             fi
-        fi
-        if ! udp_v4_fail_closed_ready; then
+        elif ! udp_v4_fail_closed_ready; then
             log "IPv4 完整 fail-closed 不可用，当前仅挡 UDP 443"
         fi
-        stop_proxy
-        remove_iptables_keep_udp_fail_closed
+        remove_udp_tproxy_only || log "拆除旧 UDP TPROXY 失败"
     else
-        remove_iptables
-        stop_proxy
+        remove_udp_iptables
     fi
+
+    stop_proxy
 
     rm -f "$ROUTEPROXY_NFQ_READY"
     setsid sh -c 'echo $$ > "$1"; exec "$2" run --config "$3"' sh \
@@ -201,12 +212,6 @@ start_service() {
         return 1
     fi
 
-    if ! setup_iptables; then
-        log "iptables 设置失败，停止 routeproxy"
-        cleanup_start_failure
-        return 1
-    fi
-
     if [ "$udp_enabled" = "1" ]; then
         _wait=0
         while [ "$_wait" -lt 150 ] && ! udp_nfq_ready; do
@@ -216,18 +221,30 @@ start_service() {
         if ! udp_nfq_ready; then
             log "NFQUEUE 未就绪，保留/安装 UDP 兜底规则；TCP 继续"
             if ! udp_v4_protected_ready; then
-                install_udp_fail_closed_or_443 || log "UDP 兜底规则也失败，请检查 iptables"
+                install_udp_fail_closed_or_443
+                _udp_rc=$?
+                if [ "$_udp_rc" -eq 1 ]; then
+                    log "UDP 兜底规则也失败，请检查 iptables"
+                fi
             fi
         elif ! wait_udp_port "$PORT" "$pid"; then
             # TCP 已建立；UDP 独立失败不拆 TCP，但不能 TPROXY 到无 listener 的端口。
             log "UDP ingress 未监听，保留/安装 UDP 兜底规则；TCP 继续"
             if ! udp_v4_protected_ready; then
-                install_udp_fail_closed_or_443 || log "UDP 兜底规则也失败，请检查 iptables"
+                install_udp_fail_closed_or_443
+                _udp_rc=$?
+                if [ "$_udp_rc" -eq 1 ]; then
+                    log "UDP 兜底规则也失败，请检查 iptables"
+                fi
             fi
         elif ! setup_udp_iptables; then
             log "UDP iptables 设置失败，保留/安装 UDP 兜底规则；TCP 继续"
             if ! udp_v4_protected_ready; then
-                install_udp_fail_closed_or_443 || log "UDP 兜底规则也失败，请检查 iptables"
+                install_udp_fail_closed_or_443
+                _udp_rc=$?
+                if [ "$_udp_rc" -eq 1 ]; then
+                    log "UDP 兜底规则也失败，请检查 iptables"
+                fi
             fi
         else
             if [ "${_udp_forward_ok:-1}" = "0" ]; then

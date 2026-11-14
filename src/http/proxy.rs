@@ -16,7 +16,8 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
-use tokio::time::timeout;
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
 
 use crate::config::Config;
 use crate::engine::{Decision, Engine, HostResolution};
@@ -426,37 +427,83 @@ async fn connect_addresses(
         bail!("没有解析到可用地址");
     }
 
+    let mut candidates = Vec::with_capacity(addresses.len());
     let mut last_error = None;
-    let total = addresses.len();
-    for (index, address) in addresses.iter().enumerate() {
+    for address in addresses {
         let address = canonicalize_addr(*address);
         if config.is_forbidden_target(address) {
             last_error = Some(anyhow!("拒绝连接本代理监听地址 {address}"));
             continue;
         }
+        candidates.push(address);
+    }
+    if candidates.is_empty() {
+        return Err(last_error.expect("地址列表非空且全部被拒绝"));
+    }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            last_error = Some(anyhow!("连接已解析地址超时"));
+    // RFC 8305：先试一个地址，250ms 后仍无结果再启动下一个；并行竞速，先成功者胜。
+    const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+    let mut tasks = JoinSet::new();
+    let mut next = 0;
+    let mut next_start = Instant::now();
+    loop {
+        if tasks.is_empty() && next >= candidates.len() {
             break;
         }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let start_at = if next < candidates.len() {
+            std::cmp::min(next_start, deadline)
+        } else {
+            deadline
+        };
 
-        // 把剩余预算分给尚未尝试的地址，避免首个黑洞 IPv6 吞掉全部 10s。
-        let attempts_left = (total - index) as u32;
-        let attempt_budget = (remaining / attempts_left).max(Duration::from_millis(200));
-
-        match timeout(attempt_budget, TcpStream::connect(address)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(error)) => {
-                last_error = Some(anyhow!("连接 {address} 失败: {error}"));
+        tokio::select! {
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(stream))) => {
+                        tasks.abort_all();
+                        return Ok(stream);
+                    }
+                    Some(Ok(Err(error))) => {
+                        last_error = Some(error);
+                        if next < candidates.len() {
+                            next_start = Instant::now();
+                        }
+                    }
+                    Some(Err(error)) => {
+                        last_error = Some(anyhow!("连接任务失败: {error}"));
+                        if next < candidates.len() {
+                            next_start = Instant::now();
+                        }
+                    }
+                    None => {}
+                }
             }
-            Err(_) => {
-                last_error = Some(anyhow!("连接 {address} 超时"));
+            _ = sleep(start_at.saturating_duration_since(now)) => {
+                if next < candidates.len() {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    let address = candidates[next];
+                    tasks.spawn(async move {
+                        TcpStream::connect(address)
+                            .await
+                            .map_err(|error| anyhow!("连接 {address} 失败: {error}"))
+                    });
+                    next += 1;
+                    next_start = Instant::now() + ATTEMPT_DELAY;
+                } else {
+                    break;
+                }
             }
         }
     }
 
-    Err(last_error.expect("非空地址列表必然记录连接错误"))
+    tasks.abort_all();
+    Err(last_error.unwrap_or_else(|| anyhow!("连接已解析地址超时")))
 }
 
 async fn connect_upstream(config: &Config) -> Result<TcpStream> {
@@ -487,5 +534,78 @@ mod tests {
         let mut parts = parts("/a?q=1");
         rewrite_request_uri(&mut parts, Decision::Proxy, "example.com").unwrap();
         assert_eq!(parts.uri.to_string(), "http://example.com/a?q=1");
+    }
+
+    fn test_config() -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[proxy]
+mode = "http"
+listen = ["127.0.0.1:16045"]
+upstream = "http://127.0.0.1:9910"
+
+[rules]
+file = "/tmp/routeproxy-test-rules.toml"
+
+[logging]
+file = "/tmp/routeproxy-test.log"
+level = "info"
+"#,
+        )
+        .unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_addresses_uses_next_candidate_after_failure() {
+        let config = test_config();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let available = listener.local_addr().unwrap();
+        let addresses = [SocketAddr::from(([127, 0, 0, 1], 1)), available];
+
+        let stream =
+            connect_addresses(&addresses, &config, Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap();
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn connect_addresses_fails_fast_when_all_candidates_fail() {
+        let config = test_config();
+        let addresses = [
+            SocketAddr::from(([127, 0, 0, 1], 1)),
+            SocketAddr::from(([127, 0, 0, 1], 2)),
+        ];
+        let started = Instant::now();
+
+        let error = connect_addresses(&addresses, &config, Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("连接"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "全部地址失败时不应等到 deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_addresses_rejects_forbidden_listener() {
+        let config = test_config();
+        let listener = config.listen_addresses()[0];
+        let error = connect_addresses(
+            &[listener],
+            &config,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("拒绝连接本代理监听地址"));
     }
 }

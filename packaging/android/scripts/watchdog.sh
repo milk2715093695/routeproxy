@@ -68,11 +68,7 @@ port_open() {
 }
 
 ensure_iptables() {
-    if iptables -w 5 -t nat -C OUTPUT -p tcp -j "$CHAIN" 2>/dev/null \
-        && iptables -w 5 -t nat -C "$CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t nat -C "$CHAIN" -m owner --uid-owner 0 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t nat -C "$CHAIN" -p tcp --dport 53 -j RETURN 2>/dev/null \
-        && iptables -w 5 -t nat -C "$CHAIN" -p tcp -j REDIRECT --to-ports "$PORT" 2>/dev/null; then
+    if tcp_iptables_ready; then
         return 0
     fi
 
@@ -84,7 +80,9 @@ ensure_udp_iptables() {
     if ! udp_nfq_ready; then
         log "NFQUEUE 未就绪，保持/安装 UDP 兜底"
         if ! udp_v4_protected_ready; then
-            if ! install_udp_fail_closed_or_443; then
+            install_udp_fail_closed_or_443
+            _udp_rc=$?
+            if [ "$_udp_rc" -eq 1 ]; then
                 log "UDP 兜底规则安装失败，保留现有规则"
                 return 1
             fi
@@ -114,7 +112,9 @@ ensure_udp_iptables() {
         else
             if ! udp_v4_protected_ready; then
                 log "UDP 无有效保护，安装兜底"
-                install_udp_fail_closed_or_443 || return 1
+                install_udp_fail_closed_or_443
+                _udp_rc=$?
+                [ "$_udp_rc" -ne 1 ] || return 1
                 return 0
             fi
             log "UDP 本地 bypass 刷新失败，保持现有规则"
@@ -199,7 +199,9 @@ while true; do
                 # ingress 不属于本 daemon：先确保兜底，再拆 TPROXY，避免直连窗口。
                 if ! udp_v4_protected_ready; then
                     log "UDP ingress 未监听，安装 UDP 兜底规则 (port=$PORT)"
-                    if ! install_udp_fail_closed_or_443; then
+                    install_udp_fail_closed_or_443
+                    _udp_rc=$?
+                    if [ "$_udp_rc" -eq 1 ]; then
                         log "UDP 兜底规则安装失败，保留现有规则"
                         tries=0
                         continue
@@ -224,7 +226,11 @@ while true; do
     log "daemon 不健康 (pid=${PID:-无}, port=$PORT, attempt=$tries)"
     if read_udp_enabled "$CONF"; then
         if ! udp_v4_protected_ready; then
-            install_udp_fail_closed_or_443 || log "UDP 兜底规则安装失败"
+            install_udp_fail_closed_or_443
+            _udp_rc=$?
+            if [ "$_udp_rc" -eq 1 ]; then
+                log "UDP 兜底规则安装失败"
+            fi
         fi
         udp_v4_protected_ready && remove_udp_tproxy_only
     fi

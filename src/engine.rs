@@ -244,7 +244,7 @@ fn decide_ip_with(rules: &Rules, ip: IpAddr) -> Decision {
     }
 }
 
-fn is_private_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_private_ip(ip: IpAddr) -> bool {
     match canonicalize_ip(ip) {
         IpAddr::V4(ip) => {
             let octets = ip.octets();

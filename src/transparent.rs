@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, timeout_at};
 
 use crate::config::Config;
-use crate::engine::{Decision, Engine};
+use crate::engine::{is_private_ip, Decision, Engine};
 use crate::http::bind_listeners;
 use crate::http::connect::connect_via_proxy;
 use crate::platform::original_dst;
@@ -140,8 +140,8 @@ async fn handle_connection(
     } else {
         match http_host.as_deref() {
             Some(host) => combine_decisions(ip_decision, engine.decide_host(host).await),
-            // 已确认是 HTTP 但 header 不完整时不能回退 Direct IP，否则可绕过域名规则。
-            None if sniff_failed => Decision::Proxy,
+            // 私网目标不能因为客户端慢启动被送进上游；公网目标仍保持 fail-closed。
+            None if sniff_failed => decide_after_sniff_failure(ip_decision, *target.ip()),
             None => ip_decision,
         }
     };
@@ -231,6 +231,14 @@ fn log_transparent_failure(
         error = %error,
         "{message}: {error}"
     );
+}
+
+fn decide_after_sniff_failure(ip: Decision, target: Ipv4Addr) -> Decision {
+    if ip == Decision::Direct && is_private_ip(IpAddr::V4(target)) {
+        Decision::Direct
+    } else {
+        Decision::Proxy
+    }
 }
 
 fn combine_decisions(ip: Decision, host: Decision) -> Decision {
@@ -342,6 +350,22 @@ mod tests {
         );
         assert_eq!(
             combine_decisions(Decision::Direct, Decision::Proxy),
+            Decision::Proxy
+        );
+    }
+
+    #[test]
+    fn sniff_failure_keeps_private_target_direct() {
+        assert_eq!(
+            decide_after_sniff_failure(Decision::Direct, Ipv4Addr::new(192, 168, 1, 10)),
+            Decision::Direct
+        );
+        assert_eq!(
+            decide_after_sniff_failure(Decision::Direct, Ipv4Addr::new(100, 64, 0, 1)),
+            Decision::Direct
+        );
+        assert_eq!(
+            decide_after_sniff_failure(Decision::Proxy, Ipv4Addr::new(192, 168, 1, 10)),
             Decision::Proxy
         );
     }

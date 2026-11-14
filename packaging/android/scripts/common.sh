@@ -66,6 +66,14 @@ EOF
 
 # service.sh、watchdog.sh、uninstall.sh 共用的 iptables 链。
 # 调用 setup_iptables 前必须设置 CHAIN 和 PORT。
+tcp_iptables_ready() {
+    iptables -w 5 -t nat -C OUTPUT -p tcp -j "$CHAIN" 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -d 127.0.0.0/8 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -m owner --uid-owner 0 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -p tcp --dport 53 -j RETURN 2>/dev/null \
+        && iptables -w 5 -t nat -C "$CHAIN" -p tcp -j REDIRECT --to-ports "$PORT" 2>/dev/null
+}
+
 setup_iptables() {
     iptables -w 5 -t nat -N "$CHAIN" 2>/dev/null || true
     iptables -w 5 -t nat -F "$CHAIN" || return 1
@@ -85,12 +93,6 @@ remove_tcp_iptables() {
 
 remove_iptables() {
     remove_udp_iptables
-    remove_tcp_iptables
-}
-
-# 重启时保留 UDP fail-closed，只拆 TPROXY/mangle 和 TCP 规则。
-remove_iptables_keep_udp_fail_closed() {
-    remove_udp_tproxy_only
     remove_tcp_iptables
 }
 
@@ -528,6 +530,7 @@ ensure_udp6_protected() {
 
 install_udp_fail_closed_or_443() {
     # IPv6 是可选能力，失败不能否决 IPv4，也不能让 TCP 跟着停。
+    # 返回 0=完整 fail-closed，2=仅 UDP 443，1=失败；调用方不能把 2 当完整保护。
     if udp_v4_fail_closed_ready; then
         ensure_udp6_protected || _udp_log "IPv6 UDP 保护安装失败，IPv4 继续"
         return 0
@@ -545,12 +548,13 @@ install_udp_fail_closed_or_443() {
             write_udp_local_state "$_udp_addrs" || _udp_log "写入 UDP 本地地址状态失败"
         fi
         ensure_udp6_protected || _udp_log "IPv6 UDP 保护安装失败，IPv4 443 继续"
-        return 0
+        _udp_log "IPv4 完整 fail-closed 不可用，仅 UDP 443 受保护"
+        return 2
     fi
     if install_udp443_drop; then
-        _udp_log "完整 UDP fail-closed 安装失败，降级为 UDP 443 DROP"
         ensure_udp6_protected || _udp_log "IPv6 UDP 443 兜底安装失败"
-        return 0
+        _udp_log "IPv4 完整 fail-closed 不可用，仅 UDP 443 受保护"
+        return 2
     fi
     return 1
 }
@@ -623,13 +627,17 @@ setup_udp_iptables() {
     fi
     if udp_tproxy_active && ! udp_v4_fail_closed_ready; then
         # 先补兜底再重建；否则重建失败会留下无保护窗口。
-        if ! install_udp_fail_closed_or_443; then
+        install_udp_fail_closed_or_443
+        _udp_rc=$?
+        if [ "$_udp_rc" -eq 1 ]; then
             _udp_log "完整 IPv4 fail-closed 未就绪，且兜底安装失败；保留现有 TPROXY"
             return 1
         fi
     fi
     if ! udp_tproxy_active && ! udp_v4_protected_ready; then
-        if ! install_udp_fail_closed_or_443; then
+        install_udp_fail_closed_or_443
+        _udp_rc=$?
+        if [ "$_udp_rc" -eq 1 ]; then
             _udp_log "UDP 兜底规则安装失败，拒绝重建"
             return 1
         fi
