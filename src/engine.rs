@@ -36,6 +36,15 @@ pub struct HostResolution {
     pub direct_ips: Option<Vec<IpAddr>>,
 }
 
+impl HostResolution {
+    /// 只有全部命中公网地址时才允许直连失败后回退代理；私网地址不能发给上游。
+    pub fn can_fallback_proxy(&self) -> bool {
+        self.direct_ips
+            .as_ref()
+            .is_some_and(|ips| !ips.is_empty() && ips.iter().all(|ip| !is_private_ip(*ip)))
+    }
+}
+
 pub struct Engine {
     rules: RwLock<Arc<Rules>>,
     rules_file: PathBuf,
@@ -287,5 +296,35 @@ mod tests {
         assert!(is_private_ip("100.127.255.254".parse().expect("IPv4")));
         assert!(!is_private_ip("100.63.255.255".parse().expect("IPv4")));
         assert!(!is_private_ip("100.128.0.1".parse().expect("IPv4")));
+    }
+
+    #[test]
+    fn direct_fallback_only_for_public_addresses() {
+        let public = HostResolution {
+            decision: Decision::Direct,
+            direct_ips: Some(vec!["1.1.1.1".parse().expect("IPv4")]),
+        };
+        assert!(public.can_fallback_proxy());
+
+        let private = HostResolution {
+            decision: Decision::Direct,
+            direct_ips: Some(vec!["192.168.1.1".parse().expect("IPv4")]),
+        };
+        assert!(!private.can_fallback_proxy());
+
+        let mixed = HostResolution {
+            decision: Decision::Direct,
+            direct_ips: Some(vec![
+                "1.1.1.1".parse().expect("IPv4"),
+                "192.168.1.1".parse().expect("IPv4"),
+            ]),
+        };
+        assert!(!mixed.can_fallback_proxy());
+
+        let unresolved = HostResolution {
+            decision: Decision::Direct,
+            direct_ips: None,
+        };
+        assert!(!unresolved.can_fallback_proxy());
     }
 }

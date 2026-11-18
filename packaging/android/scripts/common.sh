@@ -560,8 +560,11 @@ install_udp_fail_closed_or_443() {
 }
 
 udp_nfq_ready() {
-    _udp_nfq_pid="$(sed -n '1p' "$UDP_NFQ_READY_FILE" 2>/dev/null)" || return 1
-    _udp_nfq_uptime="$(sed -n '2p' "$UDP_NFQ_READY_FILE" 2>/dev/null)" || return 1
+    [ -f "$UDP_NFQ_READY_FILE" ] || return 1
+    {
+        IFS= read -r _udp_nfq_pid || return 1
+        IFS= read -r _udp_nfq_uptime || return 1
+    } < "$UDP_NFQ_READY_FILE" 2>/dev/null || return 1
     [ -n "$_udp_nfq_pid" ] && [ -n "$_udp_nfq_uptime" ] || return 1
     _udp_nfq_now="$(cut -d' ' -f1 /proc/uptime 2>/dev/null)" || return 1
     awk -v now="$_udp_nfq_now" -v up="$_udp_nfq_uptime" \

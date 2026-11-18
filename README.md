@@ -86,11 +86,13 @@ keep = 3
 - `transparent` 只对 80 端口的明文 HTTP 读取 `Host`；HTTPS 不解析 SNI，按目标 IP 决策。80 端口可用显式 Direct `Host` 把 foreign IP 提升为直连；HTTPS 仍无法做到这一点。若某个代理域名解析到直连 IP，HTTPS 请求仍会走直连，这是当前版本的已知边界，不是规则失效。
 - HTTP 模式默认在 `max_connections`（4096）之外保留 1024 个 keep-alive 连接槽，活跃请求/隧道上限同样是 4096；响应头返回后释放活跃请求许可，慢速下载只占连接槽。透明模式每个连接占客户端和上游两个 fd，需同步放宽进程 `ulimit -n`。`100.64.0.0/10`（CGNAT/Tailscale）按私有地址直连。
 - 域名规则是后缀匹配；只写 `com` 会匹配所有 `.com` 域名，这是预期语义，`rules check` 不会把它当错误。
+- 直连地址全部为公网且连接全部失败时，HTTP/CONNECT 会回退到上游代理；直连地址中包含私网地址时不回退，避免把内网目标发给上游。
 
 ### 透明 TCP（Android）
 
 - 透明 TCP 只覆盖 Android 本机 App 的 IPv4 出站连接（`nat OUTPUT`）；IPv6 TCP 不拦截，按普通直连处理；热点/转发的 TCP 也不经过 `OUTPUT`，不会被透明代理。
 - 启动时先确保 TCP 重定向规则就绪，再停旧进程；新进程启动失败时规则保留，流量继续指向未监听端口（fail-closed），不会静默回退直连。只有显式 `stop` 才撤规则。
+- `stop` 会写入 `stop.requested` 并保留；watchdog 不会拉起，重启/开机后也不会自动启动，必须显式 `start` 才清除。
 
 ### 透明 UDP（Android）
 
@@ -114,6 +116,7 @@ reject_ports = [443]
 
 - 每个 UDP 五元组 flow 使用一个 SOCKS5 UDP association，并复用同一个客户端 UDP 源 socket；不能按数据报重建 association。flow 队列有 64 MiB 全局字节预算，flow 常驻缓冲另有 64 MiB 预算（每 flow 按两块 64 KiB 预留），预算耗尽时丢新数据报/新 flow，不拆已有 flow；单个源 IP 最多 256 个 flow，全机上限由 512 flow/64 MiB 预算兜底，避免一个 app 占满全机 UDP。
 - UDP 分片不重组；非首片没有 UDP 头，带 MF 的首片也没有完整数据报，NFQUEUE 会一律丢弃。依赖 IP 分片的 UDP 应用应避免，或改用 TCP。
+- UDP NFQUEUE 的 ready 文件用同目录临时文件 + rename 原子替换；service/watchdog 一次打开读取 pid 和 uptime，避免读到半更新内容。
 - UDP 只支持 IPv4；Android 脚本在 `ip6tables` 可用时用 `ROUTEPROXY_UDP4436` 只丢弃 IPv6 UDP 443（QUIC），其他 IPv6 UDP 直连；`ip6tables` 不可用时跳过 IPv6 规则，不阻塞 IPv4。
 - UDP 443（QUIC/HTTP/3）在公共 Geph exit 被硬编码禁止，无法靠 routeproxy 或配置绕过。默认 Android 示例把 443 放入 `reject_ports`，让浏览器回落 TCP；需要真实 QUIC 时必须换支持 UDP 443 的上游。
 - `routing.exclude_ports` 和防火墙都要在 TPROXY 前排除 DNS 53；否则 DNS 会被透明 UDP 截走。smartdns 仍是唯一解析器。

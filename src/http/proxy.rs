@@ -154,10 +154,18 @@ pub async fn handle(
     if config.is_excluded_port(port) {
         resolution.decision = Decision::Direct;
     }
-    let decision = resolution.decision;
     let level = request_log_level(&host);
 
-    let result = forward(req, &host, port, &authority, &resolution, &config, permit).await;
+    let result = forward(
+        req,
+        &host,
+        port,
+        &authority,
+        &mut resolution,
+        &config,
+        permit,
+    )
+    .await;
     match result {
         Ok(response) => {
             request_event!(
@@ -165,7 +173,7 @@ pub async fn handle(
                 event = "http_request",
                 flow_id,
                 target = %authority,
-                decision = %decision,
+                decision = %resolution.decision,
                 status = response.status().as_u16(),
                 duration_ms = started.elapsed().as_millis(),
                 transport = "tcp",
@@ -179,7 +187,7 @@ pub async fn handle(
                 event = "http_request",
                 flow_id,
                 target = %authority,
-                decision = %decision,
+                decision = %resolution.decision,
                 status = 502,
                 duration_ms = started.elapsed().as_millis(),
                 transport = "tcp",
@@ -232,14 +240,28 @@ async fn forward(
     host: &str,
     port: u16,
     authority: &str,
-    resolution: &HostResolution,
+    resolution: &mut HostResolution,
     config: &Config,
     permit: Arc<OwnedSemaphorePermit>,
 ) -> Result<Response<BoxBody>> {
-    let decision = resolution.decision;
-    let stream = match decision {
+    let mut actual_decision = resolution.decision;
+    let stream = match actual_decision {
         Decision::Direct => {
-            connect_direct(host, port, config, resolution.direct_ips.as_deref()).await?
+            match connect_direct(host, port, config, resolution.direct_ips.as_deref()).await {
+                Ok(stream) => stream,
+                Err(error) if resolution.can_fallback_proxy() && !config.is_excluded_port(port) => {
+                    tracing::warn!(
+                        event = "direct_fallback",
+                        target = %authority,
+                        error = %error,
+                        "直连地址全部失败，回退上游代理"
+                    );
+                    actual_decision = Decision::Proxy;
+                    resolution.decision = actual_decision;
+                    connect_upstream(config).await?
+                }
+                Err(error) => return Err(error),
+            }
         }
         Decision::Proxy => connect_upstream(config).await?,
     };
@@ -264,7 +286,7 @@ async fn forward(
         .headers
         .insert(HOST, HeaderValue::from_str(authority)?);
 
-    rewrite_request_uri(&mut parts, decision, authority)?;
+    rewrite_request_uri(&mut parts, actual_decision, authority)?;
 
     let progress = Arc::new(Notify::new());
     let body = TimedBody::new(body, UPSTREAM_TIMEOUT, Some(Arc::clone(&progress)));

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::mem::{size_of, zeroed};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -175,7 +175,20 @@ fn write_ready(path: &Path) -> io::Result<()> {
         .ok()
         .and_then(|value| value.split_whitespace().next().map(str::to_owned))
         .unwrap_or_else(|| "0".to_owned());
-    fs::write(path, format!("{}\n{uptime}\n", std::process::id()))
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("udp-nfq.ready");
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = fs::File::create(&temp)?;
+        write!(file, "{}\n{uptime}\n", std::process::id())?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn touch_ready(ready: Option<&Path>) {

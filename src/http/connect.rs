@@ -39,12 +39,26 @@ pub async fn handle(
     if config.is_excluded_port(port) {
         resolution.decision = Decision::Direct;
     }
-    let decision = resolution.decision;
+    let mut decision = resolution.decision;
     let on_upgrade = hyper::upgrade::on(&mut req);
 
     let upstream = match decision {
         Decision::Direct => {
-            connect_direct(&host, port, &config, resolution.direct_ips.as_deref()).await
+            match connect_direct(&host, port, &config, resolution.direct_ips.as_deref()).await {
+                Ok(stream) => Ok(stream),
+                Err(error) if resolution.can_fallback_proxy() && !config.is_excluded_port(port) => {
+                    tracing::warn!(
+                        event = "direct_fallback",
+                        target = %host,
+                        port,
+                        error = %error,
+                        "直连地址全部失败，回退上游代理"
+                    );
+                    decision = Decision::Proxy;
+                    connect_via_proxy(&host, port, &config).await
+                }
+                Err(error) => Err(error),
+            }
         }
         Decision::Proxy => connect_via_proxy(&host, port, &config).await,
     };

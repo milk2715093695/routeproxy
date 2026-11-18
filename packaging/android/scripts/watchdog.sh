@@ -153,6 +153,11 @@ while true; do
     fi
     sleep 5
 
+    if [ -f "$STOP_FLAG" ]; then
+        log "收到停止请求，退出 watchdog"
+        exit 0
+    fi
+
     PORT="$(read_port "$CONF")" || {
         log "监听地址无效: $CONF"
         continue
@@ -177,7 +182,7 @@ while true; do
                         else
                             udp_restart_tries=$((udp_restart_tries + 1))
                             log "NFQUEUE 未就绪，第 $udp_restart_tries 次重启 daemon"
-                            ROUTEPROXY_NO_WATCHDOG=1 "$SERVICE" start \
+                            ROUTEPROXY_NO_WATCHDOG=1 ROUTEPROXY_RESPECT_STOP_FLAG=1 "$SERVICE" start \
                                 >> "$DATA/logs/service.log" 2>&1 || log "重启 daemon 失败"
                         fi
                         udp_fail_tries=0
@@ -212,7 +217,7 @@ while true; do
                 if [ "$ingress_tries" -ge 3 ] && [ "$ingress_restart_tries" -lt 3 ]; then
                     ingress_restart_tries=$((ingress_restart_tries + 1))
                     log "UDP ingress 连续缺失，第 $ingress_restart_tries 次重启 daemon"
-                    ROUTEPROXY_NO_WATCHDOG=1 "$SERVICE" start \
+                    ROUTEPROXY_NO_WATCHDOG=1 ROUTEPROXY_RESPECT_STOP_FLAG=1 "$SERVICE" start \
                         >> "$DATA/logs/service.log" 2>&1 || log "重启 daemon 失败"
                     ingress_tries=0
                 fi
@@ -241,7 +246,7 @@ while true; do
         continue
     fi
 
-    if ROUTEPROXY_NO_WATCHDOG=1 "$SERVICE" start \
+    if ROUTEPROXY_NO_WATCHDOG=1 ROUTEPROXY_RESPECT_STOP_FLAG=1 "$SERVICE" start \
         >> "$DATA/logs/service.log" 2>&1; then
         log "重启成功"
         tries=0

@@ -280,14 +280,18 @@ stop_service() {
     stop_watchdog
     remove_iptables
     stop_proxy
-    rm -f "$ROUTEPROXY_NFQ_READY" "$STOP_FLAG"
+    rm -f "$ROUTEPROXY_NFQ_READY"
     log "已停止"
 }
 
 case "$1" in
     start)
-        rm -f "$STOP_FLAG"
         acquire_lock || exit 1
+        if [ "${ROUTEPROXY_RESPECT_STOP_FLAG:-0}" = "1" ] && [ -f "$STOP_FLAG" ]; then
+            release_lock
+            exit 0
+        fi
+        rm -f "$STOP_FLAG"
         start_service
         rc=$?
         release_lock
@@ -295,14 +299,28 @@ case "$1" in
         ;;
     stop)
         mkdir -p "$DATA"
-        acquire_lock || exit 1
-        : > "$STOP_FLAG"
+        if ! : > "$STOP_FLAG"; then
+            log "写入停止标记失败: $STOP_FLAG"
+            exit 1
+        fi
+        _stop_lock_try=0
+        while ! acquire_lock; do
+            _stop_lock_try=$((_stop_lock_try + 1))
+            if [ "$_stop_lock_try" -ge 4 ]; then
+                log "停止失败：另一个 service 操作正在执行"
+                exit 1
+            fi
+            sleep 0.5
+        done
         stop_service
         release_lock
         ;;
     "")
-        rm -f "$STOP_FLAG"
         acquire_lock || exit 1
+        if [ -f "$STOP_FLAG" ]; then
+            release_lock
+            exit 0
+        fi
         start_service
         rc=$?
         release_lock
